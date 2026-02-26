@@ -35,10 +35,6 @@ constexpr unsigned long DISPLAY_UPDATE_INTERVAL_MS = 100;  // 10Hz
 static unsigned long lastDisplayUpdate = 0;
 
 // Convert the numeric mode constant to a human-readable string.
-// Returns a pointer to a string literal — these live in program 
-// memory and don't need to be freed. In Python you'd just return 
-// a string; in C++ string literals are a bit more primitive but 
-// work the same way for read-only use.
 static const char* mode_to_string(uint8_t mode)
 {
     switch (mode) {
@@ -56,17 +52,15 @@ static const char* mode_to_string(uint8_t mode)
 void display_init()
 {
     display.begin();
-    display.setFont(u8g2_font_6x10_tr);  // Clean, compact font
+    display.setFont(u8g2_font_6x10_tr);
     display.clearBuffer();
     display.drawStr(20, 32, "Nextgasm");
     display.sendBuffer();
 }
 
-void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePressure)
+void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePressure, NavDirection navDir)
 {
     // Throttle updates so we don't bog down the main loop.
-    // millis() keeps ticking regardless — we just skip the 
-    // expensive I2C transfer until enough time has passed.
     unsigned long now = millis();
     if (now - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL_MS) return;
     lastDisplayUpdate = now;
@@ -75,8 +69,21 @@ void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePre
     display.clearBuffer();
 
     // Mode name — large, top of screen
-    display.setFont(u8g2_font_7x14B_tr);  // Bold, slightly larger
+    display.setFont(u8g2_font_7x14B_tr);
     display.drawStr(0, 12, mode_to_string(mode));
+
+    // Nav direction indicator — top right corner
+    // Shows which direction on the 5-way switch is currently pressed.
+    // This gives immediate visual feedback for testing the switch.
+    if (navDir != NAV_NONE) {
+        // Draw direction name right-aligned in the header area
+        const char* dirName = nav_direction_name(navDir);
+        // getStrWidth() returns pixel width of a string in the current font.
+        // We use it to right-align: start position = screen width - text width.
+        // In Python terms: x = 128 - len(text) * char_width
+        int textWidth = display.getStrWidth(dirName);
+        display.drawStr(128 - textWidth, 12, dirName);
+    }
 
     // Divider line under the mode name
     display.drawHLine(0, 16, 128);
@@ -87,10 +94,6 @@ void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePre
     // Motor speed as a percentage (0-100%) and a bar graph
     int speedPct = (int)(motorSpeed / MOT_MAX * 100);
     
-    // snprintf works like Python's f-strings but with C-style format 
-    // specifiers. %d = integer, %3d = padded to 3 chars.
-    // The buffer is a small char array on the stack — you have to 
-    // pre-allocate it in C++ since strings aren't dynamic by default.
     char buf[22];
 
     snprintf(buf, sizeof(buf), "Motor: %3d%%", speedPct);

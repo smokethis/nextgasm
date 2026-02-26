@@ -21,16 +21,12 @@
 #include "state.h"
 #include "serial_report.h"
 #include "oleddisplay.h"
+#include "nav_switch.h"
 #include "HT1632C_Display.h"
 
 // ============================================================
 // Global variable DEFINITIONS
 // ============================================================
-// These are the "real" variables that allocate memory.
-// Every 'extern' declaration in globals.h and leds.h points here.
-// In Python, this would be like the module where you actually 
-// assign the initial values that everyone else imports.
-
 Encoder myEnc(3, 2);
 
 int pressure = 0;
@@ -59,10 +55,11 @@ void setup()
     button_init();
     motor_init();
     pressure_init();
+    nav_init();       // Set up 5-way navigation switch pins
 
     pinMode(BUTTPIN, INPUT);
 
-    analogReadResolution(12);  // Use full 12-bit ADC: 0-4095 instead of default 0-1023
+    analogReadResolution(12);
 
     delay(3000);  // Recovery delay for FastLED
 
@@ -73,9 +70,10 @@ void setup()
     FastLED.setBrightness(BRIGHTNESS);
 
     display_init();
+
     // Create display instance with default pins (CS=6, WR=7, DATA=8)
     HT1632C_Display ledMatrix;
-    ledMatrix.begin();   // Initialise the HT1632C display
+    ledMatrix.begin();
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -100,6 +98,9 @@ void loop()
         // Update pressure reading and running average
         update_pressure(sampleTick);
 
+        // Read 5-way nav switch (debounced)
+        NavDirection navDir = nav_read();
+
         // Fade LED buffer (creates trailing light effect)
         fadeToBlackBy(leds, NUM_LEDS, 20);
 
@@ -111,8 +112,8 @@ void loop()
         // Push LED buffer to hardware
         FastLED.show();
         
-        // Run OLED display update routine
-        display_update(state, motorSpeed, pressure, averagePressure);
+        // Run OLED display update routine (now includes nav direction)
+        display_update(state, motorSpeed, pressure, averagePressure, navDir);
 
         // Warn if pressure sensor is railing (trimpot needs adjustment)
         if (pressure > 4030) beep_motor(2093, 2093, 2093);
