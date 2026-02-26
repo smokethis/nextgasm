@@ -32,6 +32,8 @@
 //
 // The fix: send 48 bytes — LED data + zero padding for each column.
 // Column order is also reversed (RAM addr 0 = rightmost physical).
+//
+// 26/02/2026 Fix HT1632C driver: COM16 mode needs 48-byte flush + column reversal
 
 #include "HT1632C_Display.h"
 
