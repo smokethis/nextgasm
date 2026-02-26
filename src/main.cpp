@@ -44,7 +44,7 @@ HT1632C_Display ledMatrix;
 static const char* mode_to_string(uint8_t mode)
 {
     switch (mode) {
-        case MANUAL:        return "MANU";    // 4 chars fit on 24px
+        case MANUAL:        return "MANUAL";
         case AUTO:          return "AUTO";
         case OPT_SPEED:     return "SPEED";
         case OPT_RAMPSPD:   return "RAMP";
@@ -152,10 +152,7 @@ void loop()
 
         // Run state machine 
         run_state_machine(state);
-        // Check if center has been pressed and set state to STANDBY if so
-        if (navDir == NAV_CENTER) {
-            state = STANDBY;
-        }
+
         // Check if direction has been pressed and take action if so. 
         // Be sure to only activate once when changing modes.
         switch (navDir) {
@@ -163,24 +160,36 @@ void loop()
                 if (lastNavDir != NAV_LEFT) {
                     nextState = get_previous_state(state);
                     run_state_machine(nextState);
+                    state = nextState;
                     lastNavDir = navDir;
                 }
+                break;
             case NAV_RIGHT:
                 if (lastNavDir != NAV_RIGHT) {
                     nextState = get_next_state(state);
                     run_state_machine(nextState);
+                    state = nextState;
                     lastNavDir = navDir;
                 }
+                break;
             case NAV_UP:
                 if (lastNavDir != NAV_UP) {
                     lastNavDir = navDir;
                 }
+                break;
             case NAV_DOWN:
                 if (lastNavDir != NAV_DOWN) {
                     lastNavDir = navDir;
                 }
-            case NAV_CENTER: run_state_machine(STANDBY);
-            case NAV_NONE: ;
+                break;
+            case NAV_CENTER: 
+                state = STANDBY;
+                run_state_machine(state);
+                lastNavDir = navDir;
+                break;
+            case NAV_NONE:
+                lastNavDir = navDir;
+                break;
         }
 
         // Push LED buffer to hardware

@@ -55,8 +55,8 @@ uint8_t get_previous_state(uint8_t state) {
         }
     }
 
-    // Move to next
-    int nextIndex = (currentIndex - 1) % modeCount;
+    // Move to previous
+    int nextIndex = (currentIndex - 1 + modeCount) % modeCount;
     state = modeList[nextIndex];
 
     return state;
