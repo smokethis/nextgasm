@@ -69,6 +69,21 @@ public:
     uint8_t drawChar(uint8_t x, char c);
     void drawString(uint8_t x, const char* str);
 
+    // --- Scrolling text ---
+    // Call this every tick from the main loop. It manages its own 
+    // timing and scroll offset internally — you just pass the text 
+    // and the scroll interval (ms between each 1-pixel shift).
+    //
+    // If the text fits on screen without scrolling, it just draws 
+    // it statically (no wasted motion).
+    //
+    // If you pass different text than last time, the scroll resets
+    // automatically — so mode changes look instant.
+    //
+    // Returns true if it actually redrew (useful if you want to 
+    // avoid redundant flush() calls elsewhere).
+    bool scrollText(const char* text, unsigned long scrollIntervalMs = 50);
+
     uint8_t* getBuffer();
 
 private:
@@ -77,6 +92,22 @@ private:
     uint8_t _pinDATA;
 
     uint8_t _buffer[HT1632C_WIDTH];
+
+    // --- Scroll state ---
+    // These persist between calls to scrollText(), tracking where 
+    // we are in the animation. In Python terms, they're like 
+    // instance variables on a class — self._scrollOffset etc.
+    int _scrollOffset;                  // Current pixel offset (starts at WIDTH, decreases)
+    unsigned long _lastScrollTime;      // millis() of last pixel shift
+    const char* _lastText;              // Detect when text changes to reset scroll
+    int _textPixelWidth;                // Cached total width of current text in pixels
+
+    // --- Private drawing helpers ---
+    // Like drawChar/drawString but using signed int for x position,
+    // allowing characters to be partially off the left edge.
+    // The originals stay untouched with uint8_t for backwards compat.
+    void _drawCharSigned(int x, char c);
+    void _drawStringSigned(int x, const char* str);
 
     void _writeBits(uint16_t data, uint8_t numBits);
     void _sendCommand(uint8_t cmd);

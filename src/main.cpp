@@ -131,7 +131,6 @@ void loop()
     // there's no point redrawing identical content 60 times 
     // per second. This is the same idea as React's "only 
     // re-render when state changes" philosophy.
-    static uint8_t lastDisplayedState = 255;  // Invalid initial value forces first draw
 
     if (millis() - lastTick >= UPDATE_PERIOD_MS) {
         lastTick = millis();
@@ -196,12 +195,7 @@ void loop()
         FastLED.show();
 
         // Update LED matrix when mode changes
-        if (state != lastDisplayedState) {
-            ledMatrix.clear();
-            ledMatrix.drawString(0, mode_to_string(state));
-            ledMatrix.flush();
-            lastDisplayedState = state;
-        }
+        ledMatrix.scrollText(mode_to_string(state));
         
         // Run OLED display update routine (now includes nav direction)
         display_update(state, motorSpeed, pressure, averagePressure, navDir);

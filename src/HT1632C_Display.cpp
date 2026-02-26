@@ -34,6 +34,7 @@
 // Column order is also reversed (RAM addr 0 = rightmost physical).
 //
 // 26/02/2026 Fix HT1632C driver: COM16 mode needs 48-byte flush + column reversal
+// 26/02/2026 Add scrollText() with signed-position drawing helpers
 
 #include "HT1632C_Display.h"
 
@@ -104,6 +105,9 @@ static const uint8_t FONT_5X7[][5] PROGMEM = {
 
 #define FONT_FIRST_CHAR 32
 #define FONT_LAST_CHAR  90
+#define FONT_CHAR_WIDTH 5
+#define FONT_CHAR_SPACING 1  // 1px gap between characters
+#define FONT_TOTAL_CHAR_WIDTH (FONT_CHAR_WIDTH + FONT_CHAR_SPACING)  // 6px per char
 
 
 // ════════════════════════════════════════════════════════════════════════
@@ -111,7 +115,8 @@ static const uint8_t FONT_5X7[][5] PROGMEM = {
 // ════════════════════════════════════════════════════════════════════════
 
 HT1632C_Display::HT1632C_Display(uint8_t pinCS, uint8_t pinWR, uint8_t pinDATA)
-    : _pinCS(pinCS), _pinWR(pinWR), _pinDATA(pinDATA)
+    : _pinCS(pinCS), _pinWR(pinWR), _pinDATA(pinDATA),
+      _scrollOffset(0), _lastScrollTime(0), _lastText(nullptr), _textPixelWidth(0)
 {
     memset(_buffer, 0, HT1632C_WIDTH);
 }
@@ -262,7 +267,7 @@ void HT1632C_Display::setBrightness(uint8_t level) {
 
 
 // ════════════════════════════════════════════════════════════════════════
-// Convenience Drawing Functions
+// Convenience Drawing Functions (original — unsigned x)
 // ════════════════════════════════════════════════════════════════════════
 
 void HT1632C_Display::drawBar(int value, int maxValue) {
@@ -276,12 +281,12 @@ uint8_t HT1632C_Display::drawChar(uint8_t x, char c) {
     if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) c = ' ';
     uint8_t index = c - FONT_FIRST_CHAR;
 
-    for (uint8_t col = 0; col < 5; col++) {
+    for (uint8_t col = 0; col < FONT_CHAR_WIDTH; col++) {
         uint8_t colX = x + col;
         if (colX >= HT1632C_WIDTH) break;
         _buffer[colX] = pgm_read_byte(&FONT_5X7[index][col]);
     }
-    return 6;
+    return FONT_TOTAL_CHAR_WIDTH;
 }
 
 void HT1632C_Display::drawString(uint8_t x, const char* str) {
@@ -290,6 +295,163 @@ void HT1632C_Display::drawString(uint8_t x, const char* str) {
         str++;
     }
 }
+
+
+// ════════════════════════════════════════════════════════════════════════
+// Signed-position Drawing Helpers (private — for scrolling)
+// ════════════════════════════════════════════════════════════════════════
+//
+// These are like drawChar/drawString but accept a signed int for the 
+// x position. This allows text to be partially off the left edge of 
+// the display — essential for smooth scrolling.
+//
+// In Python you'd just use negative indices and let the list handle 
+// bounds. In C++, writing to _buffer[-3] would corrupt random memory,
+// so we have to explicitly skip columns that fall outside 0..WIDTH-1.
+//
+// The original functions stay untouched with uint8_t x so existing 
+// code (like the static mode_to_string display) keeps working without 
+// any changes.
+
+void HT1632C_Display::_drawCharSigned(int x, char c)
+{
+    if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) c = ' ';
+    uint8_t index = c - FONT_FIRST_CHAR;
+
+    for (int col = 0; col < FONT_CHAR_WIDTH; col++) {
+        int colX = x + col;
+
+        // Skip columns that are off-screen in either direction.
+        // This is the key difference from drawChar() — we handle 
+        // negative positions gracefully instead of relying on 
+        // uint8_t wrapping.
+        if (colX < 0) continue;            // Off the left edge
+        if (colX >= HT1632C_WIDTH) break;  // Off the right edge (and all remaining will be too)
+
+        _buffer[colX] = pgm_read_byte(&FONT_5X7[index][col]);
+    }
+}
+
+void HT1632C_Display::_drawStringSigned(int x, const char* str)
+{
+    while (*str) {
+        // Once we're fully off the right edge, no point continuing
+        if (x >= HT1632C_WIDTH) break;
+
+        // Only bother drawing if at least part of the character is 
+        // on screen. A char is 5px wide, so it's visible if 
+        // x > -FONT_CHAR_WIDTH (i.e. its rightmost column is at x+4 >= 0).
+        if (x > -FONT_CHAR_WIDTH) {
+            _drawCharSigned(x, *str);
+        }
+
+        x += FONT_TOTAL_CHAR_WIDTH;  // Advance cursor (5px char + 1px gap)
+        str++;
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════
+// Scrolling Text
+// ════════════════════════════════════════════════════════════════════════
+//
+// Call this once per main loop tick. It handles everything internally:
+//   - Timing (only shifts by 1 pixel every scrollIntervalMs)
+//   - Resetting when the text changes (instant response to mode changes)
+//   - Skipping the scroll entirely for short text that fits on screen
+//
+// The scroll cycle is:
+//   1. Text starts fully on-screen, left-aligned (brief pause to read)
+//   2. Scrolls left until fully off-screen
+//   3. Re-enters from the right edge
+//   4. Scrolls left until left-aligned again
+//   5. Repeat from step 1
+//
+// In Python terms, the equivalent would be something like:
+//
+//   class Scroller:
+//       def __init__(self):
+//           self.offset = 0
+//           self.last_text = None
+//
+//       def tick(self, text):
+//           if text != self.last_text:
+//               self.offset = 0          # reset on change
+//               self.last_text = text
+//           draw(x=self.offset, text=text)
+//           self.offset -= 1
+//           if self.offset < -len(text) * 6:
+//               self.offset = SCREEN_WIDTH
+
+bool HT1632C_Display::scrollText(const char* text, unsigned long scrollIntervalMs)
+{
+    // --- Detect text change and reset scroll ---
+    // We compare the pointer, not the string content. This works 
+    // because mode_to_string() returns pointers to string literals, 
+    // which have fixed addresses. If you were passing dynamically 
+    // built strings, you'd need strcmp() instead.
+    //
+    // In Python terms: we're doing "is" (identity) not "==" (equality).
+    // That's fine here because string literals in C++ are interned 
+    // (same text → same address), much like small strings in Python.
+    if (text != _lastText) {
+        _lastText = text;
+        _scrollOffset = 0;
+        _lastScrollTime = millis();
+
+        // Calculate total pixel width of the text.
+        // Each character is 6px (5px glyph + 1px spacing), minus 
+        // the trailing space after the last character.
+        int len = 0;
+        const char* p = text;
+        while (*p) { len++; p++; }
+        _textPixelWidth = (len * FONT_TOTAL_CHAR_WIDTH) - FONT_CHAR_SPACING;
+
+        // Draw immediately on change (don't wait for first scroll tick)
+        clear();
+        if (_textPixelWidth <= HT1632C_WIDTH) {
+            // Short text — draw statically, centred
+            int centreX = (HT1632C_WIDTH - _textPixelWidth) / 2;
+            _drawStringSigned(centreX, text);
+        } else {
+            // Long text — draw at position 0 (start of scroll)
+            _drawStringSigned(0, text);
+        }
+        flush();
+        return true;
+    }
+
+    // --- Short text that fits on screen: nothing to scroll ---
+    if (_textPixelWidth <= HT1632C_WIDTH) {
+        return false;  // Already drawn statically above
+    }
+
+    // --- Check if it's time to shift by one pixel ---
+    unsigned long now = millis();
+    if (now - _lastScrollTime < scrollIntervalMs) {
+        return false;  // Not time yet
+    }
+    _lastScrollTime = now;
+
+    // --- Advance the scroll ---
+    _scrollOffset--;
+
+    // Once the text has fully scrolled off the left edge, wrap 
+    // around so it re-enters from the right.
+    // The text disappears when its rightmost pixel (at offset + width)
+    // goes below 0, i.e. offset < -_textPixelWidth.
+    // We reset to HT1632C_WIDTH so it smoothly enters from the right.
+    if (_scrollOffset < -_textPixelWidth) {
+        _scrollOffset = HT1632C_WIDTH;
+    }
+
+    // --- Redraw at new position ---
+    clear();
+    _drawStringSigned(_scrollOffset, text);
+    flush();
+    return true;
+}
+
 
 uint8_t* HT1632C_Display::getBuffer() {
     return _buffer;
