@@ -1,48 +1,43 @@
 // HT1632C_Display.cpp
 // Implementation of the HT1632C driver for DFRobot FireBeetle 24×8 LED Matrix
 //
-// See HT1632C_Display.h for an overview of how the protocol works.
 // ═══════════════════════════════════════════════════════════════════════
 // WIRING (Teensy 4.0 → HT1632C display board)
 // ═══════════════════════════════════════════════════════════════════════
-//
-// The DFRobot FireBeetle display board should have test pads or a
-// connector for the HT1632C signals. Look for these labels on the PCB:
-//
-//   Teensy Pin 6  ──→  CS   (Chip Select)
+//   Teensy Pin 6  ──→  CS   (directly, or via the DIP-switch-selected pad)
 //   Teensy Pin 7  ──→  WR   (Write Clock)
 //   Teensy Pin 8  ──→  DATA (Data In)
-//   Teensy 3.3V   ──→  VCC  (The HT1632C runs at 3–5V; 3.3V is fine)
+//   Teensy 3.3V   ──→  VCC
 //   Teensy GND    ──→  GND
 //
-// These default pins were chosen to avoid conflicts with existing I/O:
-//   Pin 2,3 = Encoder      Pin 5  = Encoder button
-//   Pin 9   = Motor PWM    Pin 10 = NeoPixel ring
-//   Pin A0  = Pressure     Pin 6,7,8 = FREE → used for display
-//
-// IMPORTANT: The Teensy 4.0 is 3.3V logic. The HT1632C accepts 3.3V
-// just fine on its inputs. If your display board has its own 5V rail for
-// the LEDs, that's fine — the logic interface still works at 3.3V.
-//
 // ═══════════════════════════════════════════════════════════════════════
+// HOW THE RAM LAYOUT WAS FIGURED OUT (from hardware testing)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The HT1632C addresses RAM in nibbles (4-bit chunks), NOT bytes.
+// In 24×16 COM mode (command 0x24), each column takes 4 nibbles:
+//
+//   Nibble 0,1 (byte 0) = COM0–COM7  ← the 8 real LEDs
+//   Nibble 2,3 (byte 1) = COM8–COM15 ← nothing connected, just padding
+//
+// When we burst-write 24 bytes naively (one per column), the chip
+// consumes them as pairs:
+//   Byte 0 → nibbles 0,1 → Column 0, COM0-7 (LEDs light!)
+//   Byte 1 → nibbles 2,3 → Column 0, COM8-15 (blank — no LEDs!)
+//   Byte 2 → nibbles 4,5 → Column 1, COM0-7 (LEDs light!)
+//   Byte 3 → nibbles 6,7 → Column 1, COM8-15 (blank!)
+//
+// This explains exactly what was observed: only even-indexed bytes
+// produced visible output, and 24 bytes only covered 12 columns.
+//
+// The fix: send 48 bytes — LED data + zero padding for each column.
+// Column order is also reversed (RAM addr 0 = rightmost physical).
 
 #include "HT1632C_Display.h"
 
 // ── Basic 5×7 Font ─────────────────────────────────────────────────────
-// Each character is 5 bytes wide. Each byte is a column, with bit 0 at
-// the top. This is a very common format for small LED matrix fonts.
-//
-// For example, the letter 'A' looks like this on the grid:
-//
-//   Col:  0     1     2     3     4
-//         .XX.  X..X  XXXX  X..X  X..X
-//  Bit 0  0     1     1     1     0       → 0x7E
-//  Bit 1  1     0     0     0     1       ...etc
-//  (rendered transposed as column bytes)
-//
-// We only include ASCII 32 (space) through 90 (Z) to save memory.
-// Expand as needed — each character costs just 5 bytes.
-
+// Each character is 5 bytes wide, each byte is one column with bit 0
+// at the top. ASCII 32 (space) through 90 (Z).
 static const uint8_t FONT_5X7[][5] PROGMEM = {
     {0x00, 0x00, 0x00, 0x00, 0x00}, // 32: space
     {0x00, 0x00, 0x5F, 0x00, 0x00}, // 33: !
@@ -105,7 +100,6 @@ static const uint8_t FONT_5X7[][5] PROGMEM = {
     {0x61, 0x51, 0x49, 0x45, 0x43}, // 90: Z
 };
 
-// Number of characters in the font table
 #define FONT_FIRST_CHAR 32
 #define FONT_LAST_CHAR  90
 
@@ -114,15 +108,9 @@ static const uint8_t FONT_5X7[][5] PROGMEM = {
 // Constructor
 // ════════════════════════════════════════════════════════════════════════
 
-// The colon syntax below is an "initialiser list" — a C++ way of setting
-// member variables before the constructor body runs. It's more efficient
-// than assigning inside the braces for simple types.
-
 HT1632C_Display::HT1632C_Display(uint8_t pinCS, uint8_t pinWR, uint8_t pinDATA)
     : _pinCS(pinCS), _pinWR(pinWR), _pinDATA(pinDATA)
 {
-    // Zero the framebuffer.
-    // memset is like: for i in range(24): self.buffer[i] = 0
     memset(_buffer, 0, HT1632C_WIDTH);
 }
 
@@ -131,79 +119,20 @@ HT1632C_Display::HT1632C_Display(uint8_t pinCS, uint8_t pinWR, uint8_t pinDATA)
 // Low-level bit-banging
 // ════════════════════════════════════════════════════════════════════════
 
-// Clock out `numBits` from `data`, MSB first.
-//
-// This is the fundamental building block of the protocol. Every command
-// and data write goes through here. The timing works like this:
-//
-//   1. Set DATA pin to the bit value (high or low)
-//   2. Pull WR low  (chip: "I see you're about to give me a bit...")
-//   3. Pull WR high (chip: "Got it! I latched that bit on this rising edge")
-//   4. Repeat for next bit
-//
-// The HT1632C is very tolerant on timing — the datasheet minimum is just
-// 250ns per half-cycle, and digitalWriteFast on Teensy 4.0 is ~2ns, so
-// even without delays we're fine. If you ported this to a much faster MCU
-// you might need a small delay.
-
 void HT1632C_Display::_writeBits(uint16_t data, uint8_t numBits) {
     for (uint8_t i = numBits; i > 0; i--) {
-        // Isolate the current bit (MSB first).
-        // In Python: bit = (data >> (i-1)) & 1
         uint8_t bit = (data >> (i - 1)) & 1;
-
-        digitalWriteFast(_pinDATA, bit);   // Set data line
-        digitalWriteFast(_pinWR, LOW);     // WR low — prepare
-        digitalWriteFast(_pinWR, HIGH);    // WR high — chip latches bit
+        digitalWriteFast(_pinDATA, bit);
+        digitalWriteFast(_pinWR, LOW);
+        digitalWriteFast(_pinWR, HIGH);
     }
 }
 
-
-// Send a command to the HT1632C.
-//
-// Command frame format (12 bits total):
-//   [100] [CCCCCCCC] [X]
-//    ^^^   ^^^^^^^^    ^
-//    ID    command     "don't care" bit (protocol requires it)
-//
-// The 3-bit ID "100" means "this is a command".
-
 void HT1632C_Display::_sendCommand(uint8_t cmd) {
-    digitalWriteFast(_pinCS, LOW);       // Begin transaction
-
-    _writeBits(0b100, 3);               // Command ID: 100
-    _writeBits(cmd, 8);                 // 8-bit command
-    _writeBits(0, 1);                   // Extra "don't care" bit
-
-    digitalWriteFast(_pinCS, HIGH);      // End transaction
-}
-
-
-// Write one byte of pixel data to a specific address in display RAM.
-//
-// Write frame format:
-//   [101] [AAAAAAA] [DDDD] [DDDD]
-//    ^^^   ^^^^^^^   ^^^^   ^^^^
-//    ID    7-bit     high   low nibble
-//          address   nibble of data
-//
-// The HT1632C addresses RAM in nibbles (4 bits), but we send a full byte
-// (two nibbles) in one go by continuing to clock data after the first
-// nibble. The address auto-increments, so the second nibble lands at
-// addr+1. This means each call writes 8 bits = 8 LEDs = one full column.
-//
-// Address mapping for 24×8 mode:
-//   Column 0 → address 0  (high nibble at addr 0, low nibble at addr 1)
-//   Column 1 → address 2
-//   Column N → address N*2
-
-void HT1632C_Display::_writeDataAt(uint8_t addr, uint8_t data) {
     digitalWriteFast(_pinCS, LOW);
-
-    _writeBits(0b101, 3);               // Write ID: 101
-    _writeBits(addr, 7);                // 7-bit RAM address
-    _writeBits(data, 8);                // 8 bits of pixel data (2 nibbles)
-
+    _writeBits(0b100, 3);     // Command ID
+    _writeBits(cmd, 8);       // 8-bit command
+    _writeBits(0, 1);         // Don't care bit
     digitalWriteFast(_pinCS, HIGH);
 }
 
@@ -213,25 +142,20 @@ void HT1632C_Display::_writeDataAt(uint8_t addr, uint8_t data) {
 // ════════════════════════════════════════════════════════════════════════
 
 void HT1632C_Display::begin() {
-    // Configure pins as outputs
     pinMode(_pinCS, OUTPUT);
     pinMode(_pinWR, OUTPUT);
     pinMode(_pinDATA, OUTPUT);
 
-    // Start with CS and WR high (idle state)
     digitalWriteFast(_pinCS, HIGH);
     digitalWriteFast(_pinWR, HIGH);
 
-    // Boot sequence — order matters here!
-    // It's like calling a series of setup functions on the chip:
-    _sendCommand(HT1632C_CMD_SYS_EN);      // 1. Wake up the oscillator
-    _sendCommand(HT1632C_CMD_N_MOS_COM8);  // 2. Configure for 24×8 NMOS mode
-    _sendCommand(HT1632C_CMD_INT_RC);      // 3. Use internal RC clock
-    _sendCommand(HT1632C_CMD_LED_ON);      // 4. Enable the LED driver
-    _sendCommand(HT1632C_CMD_BLINK_OFF);   // 5. No blinking
-    setBrightness(8);                       // 6. Mid brightness (~50%)
+    _sendCommand(HT1632C_CMD_SYS_EN);         // 1. Wake oscillator
+    _sendCommand(HT1632C_CMD_NMOS_24x16);     // 2. 24 ROW × 16 COM mode
+    _sendCommand(HT1632C_CMD_INT_RC);         // 3. Internal RC clock
+    _sendCommand(HT1632C_CMD_LED_ON);         // 4. LED driver on
+    _sendCommand(HT1632C_CMD_BLINK_OFF);      // 5. No blinking
+    setBrightness(8);                          // 6. Mid brightness
 
-    // Clear the display RAM on the chip (not just our local buffer)
     clear();
     flush();
 }
@@ -247,10 +171,8 @@ void HT1632C_Display::shutdown() {
 // ════════════════════════════════════════════════════════════════════════
 // Framebuffer Operations
 // ════════════════════════════════════════════════════════════════════════
-// We maintain a local copy of the display contents (_buffer) and only
-// push it to the chip when flush() is called. This is like the FastLED
-// pattern in the main code: you modify the leds[] array, then call
-// FastLED.show() to push it out.
+// Our buffer is 24 bytes — one per logical column, bit 0 = top row.
+// The mapping to hardware RAM is handled entirely by flush().
 
 void HT1632C_Display::clear() {
     memset(_buffer, 0x00, HT1632C_WIDTH);
@@ -261,22 +183,12 @@ void HT1632C_Display::fill() {
 }
 
 void HT1632C_Display::setPixel(uint8_t x, uint8_t y) {
-    if (x >= HT1632C_WIDTH || y >= HT1632C_HEIGHT) return;  // Bounds check
-
-    // Set bit `y` in column `x`.
-    // In Python: self.buffer[x] |= (1 << y)
-    // The |= is a bitwise OR-assign — it turns on that one bit without
-    // disturbing the others. Like flipping one switch in a row of 8.
+    if (x >= HT1632C_WIDTH || y >= HT1632C_HEIGHT) return;
     _buffer[x] |= (1 << y);
 }
 
 void HT1632C_Display::clearPixel(uint8_t x, uint8_t y) {
     if (x >= HT1632C_WIDTH || y >= HT1632C_HEIGHT) return;
-
-    // Clear bit `y` in column `x`.
-    // The ~(1 << y) creates a mask with all bits set EXCEPT bit y,
-    // then AND-ing clears just that one bit.
-    // In Python: self.buffer[x] &= ~(1 << y)
     _buffer[x] &= ~(1 << y);
 }
 
@@ -292,35 +204,55 @@ void HT1632C_Display::setColumn(uint8_t col, uint8_t data) {
 
 
 // ════════════════════════════════════════════════════════════════════════
-// Display Output
+// Display Output — THE CRITICAL FIX
 // ════════════════════════════════════════════════════════════════════════
-
+//
 // Push the entire framebuffer to the HT1632C.
 //
-// We use a "burst write" optimisation: start writing at address 0 and
-// just keep clocking data — the HT1632C auto-increments the address
-// after each nibble. This is significantly faster than writing each
-// address individually (24 transactions → 1 transaction).
+// Two corrections based on hardware testing:
+//
+// 1. COM16 PADDING: Each physical column needs 2 bytes of RAM.
+//    The first byte is COM0-7 (the actual LEDs), the second byte
+//    is COM8-15 (no LEDs, sent as 0x00). Without this padding,
+//    our 24 bytes only filled 12 physical columns.
+//
+// 2. COLUMN REVERSAL: RAM address 0 maps to the rightmost physical
+//    column. We send columns in reverse so that buffer[0] (leftmost
+//    in our drawing coordinate system) ends up at the left of the
+//    physical display.
+//
+// In Python terms, the old (broken) code was:
+//   for col in buffer:
+//       send(col)                        # 24 bytes → 12 columns!
+//
+// The fix:
+//   for col in reversed(buffer):
+//       send(col)   # LED data byte
+//       send(0x00)  # padding byte       # 48 bytes → 24 columns!
 
 void HT1632C_Display::flush() {
     digitalWriteFast(_pinCS, LOW);
 
     _writeBits(0b101, 3);     // Write mode ID
-    _writeBits(0x00, 7);      // Start at address 0
+    _writeBits(0x00, 7);      // Start at RAM address 0
 
-    // Stream all 24 columns. Each column is 8 bits (2 nibbles), and
-    // the address auto-increments by nibble, so this fills all 48
-    // nibbles of the display RAM in one continuous burst.
-    for (uint8_t col = 0; col < HT1632C_WIDTH; col++) {
-        _writeBits(_buffer[col], 8);
+    // Send 24 columns × 2 bytes each = 48 bytes total.
+    // Reverse order: buffer[23] goes to RAM addr 0 (rightmost),
+    // buffer[0] goes to RAM addr 46 (leftmost).
+    //
+    // Using int8_t (signed) because we count down past zero.
+    // With uint8_t, decrementing 0 would wrap to 255 and loop forever.
+    // It's a classic C/C++ gotcha — Python's range(23, -1, -1) handles
+    // this automatically, but in C++ we have to think about the type.
+    for (int8_t col = HT1632C_WIDTH - 1; col >= 0; col--) {
+        _writeBits(_buffer[col], 8);  // COM0–7: the 8 actual LEDs
+        _writeBits(0x00, 8);          // COM8–15: padding (no LEDs here)
     }
 
     digitalWriteFast(_pinCS, HIGH);
 }
 
 
-// Set display brightness (PWM duty cycle).
-// Level 0 = 1/16 duty, Level 15 = 16/16 duty.
 void HT1632C_Display::setBrightness(uint8_t level) {
     if (level > 15) level = 15;
     _sendCommand(HT1632C_CMD_PWM_BASE | level);
@@ -331,56 +263,24 @@ void HT1632C_Display::setBrightness(uint8_t level) {
 // Convenience Drawing Functions
 // ════════════════════════════════════════════════════════════════════════
 
-// Draw a horizontal bar graph across the 24 columns.
-// Fills columns from left to right proportional to value/maxValue.
-// All 8 rows in each filled column are lit — gives a solid bar.
-//
-// This maps nicely to displaying motor speed, pressure, etc.
-// For example:
-//   display.drawBar(motorSpeed, 255);       // Show speed as bar
-//   display.drawBar(pressure - avg, limit); // Show pressure delta
-
 void HT1632C_Display::drawBar(int value, int maxValue) {
-    // map() works just like Arduino's built-in map function, or in
-    // Python: int(value / maxValue * (WIDTH - 1))
     int cols = map(constrain(value, 0, maxValue), 0, maxValue, 0, HT1632C_WIDTH);
-
     for (uint8_t x = 0; x < HT1632C_WIDTH; x++) {
         _buffer[x] = (x < cols) ? 0xFF : 0x00;
     }
 }
 
-
-// Draw a single character from the 5×7 font at horizontal position x.
-// Returns the character width (5) plus 1 pixel gap = 6, so you can
-// chain calls to render strings:
-//   uint8_t x = 0;
-//   x += display.drawChar(x, 'H');
-//   x += display.drawChar(x, 'I');
-
 uint8_t HT1632C_Display::drawChar(uint8_t x, char c) {
-    // Clamp to supported range
     if (c < FONT_FIRST_CHAR || c > FONT_LAST_CHAR) c = ' ';
-
     uint8_t index = c - FONT_FIRST_CHAR;
 
     for (uint8_t col = 0; col < 5; col++) {
         uint8_t colX = x + col;
-        if (colX >= HT1632C_WIDTH) break;  // Don't write past the edge
-
-        // pgm_read_byte reads from PROGMEM (flash memory) on AVR.
-        // On Teensy 4.0/ARM this just reads normally, but using the
-        // macro keeps the code portable to Arduino Uno etc.
+        if (colX >= HT1632C_WIDTH) break;
         _buffer[colX] = pgm_read_byte(&FONT_5X7[index][col]);
     }
-
-    // Return width consumed (5 pixels + 1 gap)
     return 6;
 }
-
-
-// Draw a null-terminated string starting at position x.
-// Characters that would extend past column 23 are clipped.
 
 void HT1632C_Display::drawString(uint8_t x, const char* str) {
     while (*str && x < HT1632C_WIDTH) {
@@ -389,8 +289,6 @@ void HT1632C_Display::drawString(uint8_t x, const char* str) {
     }
 }
 
-
-// Direct buffer access for advanced use
 uint8_t* HT1632C_Display::getBuffer() {
     return _buffer;
 }
