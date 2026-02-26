@@ -8,11 +8,17 @@
 #include "buttons.h"    // for encLimitRead
 #include "pressure.h"
 
+
+// --- Standby mode ---
+// Kills all motor output and enters a passive state ready to change modes.
+void run_standby() {
+    motor_write(0);
+}
+
 // --- Manual mode (Red) ---
 // User directly controls motor speed with the knob.
 // LED ring shows pressure level in the background as a bar graph.
-void run_manual()
-{
+void run_manual() {
     int knob = encLimitRead(0, NUM_LEDS - 1);
     motorSpeed = map(knob, 0, NUM_LEDS - 1, 0., (float)MOT_MAX);
     motor_write((int)motorSpeed);
@@ -30,8 +36,7 @@ void run_manual()
 // Motor ramps up linearly. If pressure spike detected (approaching 
 // orgasm), motor cuts immediately and waits through a cooldown 
 // before ramping again. Knob adjusts detection sensitivity.
-void run_auto()
-{
+void run_auto() {
     // 'static' here means these persist between calls — like 
     // instance variables on a Python class. They keep their value 
     // from one 60Hz tick to the next.

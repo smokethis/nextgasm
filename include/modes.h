@@ -18,3 +18,4 @@ void run_opt_rampspd();
 void run_opt_beep();
 void run_opt_pres();
 void run_opt_userModeChange();
+void run_standby();

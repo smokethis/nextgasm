@@ -45,6 +45,7 @@ static const char* mode_to_string(uint8_t mode)
         case OPT_BEEP:     return "Settings";
         case OPT_PRES:     return "Pressure";
         case OPT_USER_MODE: return "User Mode";
+        case STANDBY:      return "Standby";
         default:           return "Unknown";
     }
 }

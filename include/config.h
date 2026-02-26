@@ -44,13 +44,14 @@ constexpr uint8_t MAX_SPEED_ADDR = 2;
 constexpr uint8_t SENSITIVITY_ADDR = 3;
 
 // --- State machine modes ---
-constexpr uint8_t MANUAL = 1;
-constexpr uint8_t AUTO = 2;
-constexpr uint8_t OPT_SPEED = 3;
-constexpr uint8_t OPT_RAMPSPD = 4;
-constexpr uint8_t OPT_BEEP = 5;
-constexpr uint8_t OPT_PRES = 6;
-constexpr uint8_t OPT_USER_MODE = 7;
+constexpr uint8_t STANDBY = 1;
+constexpr uint8_t MANUAL = 2;
+constexpr uint8_t AUTO = 3;
+constexpr uint8_t OPT_SPEED = 4;
+constexpr uint8_t OPT_RAMPSPD = 5;
+constexpr uint8_t OPT_BEEP = 6;
+constexpr uint8_t OPT_PRES = 7;
+constexpr uint8_t OPT_USER_MODE = 8;
 
 // --- Button states ---
 constexpr uint8_t BTN_NONE = 0;

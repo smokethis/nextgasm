@@ -1,5 +1,5 @@
 // main.cpp — Main entry point for the Nextgasm project
-// Forked from protogasm: https://github.com/night-howler/protogasm
+// Based on code from protogasm: https://github.com/night-howler/protogasm
 //
 // This file now only handles:
 //   1. Defining global variables (the "real" copies that extern points to)
@@ -23,6 +23,38 @@
 #include "oleddisplay.h"
 #include "nav_switch.h"
 #include "HT1632C_Display.h"
+
+// ============================================================
+// File-scope objects
+// ============================================================
+// The LED matrix lives here at file scope so it persists for the 
+// lifetime of the program. Previously it was declared inside setup(),
+// which meant C++ destroyed it when setup() returned — like a local 
+// variable going out of scope in a Python function. The object still 
+// existed in memory (embedded systems don't reclaim stack frames the 
+// same way), but it was technically "dead" and any future use would 
+// be undefined behaviour.
+HT1632C_Display ledMatrix;
+
+// Convert mode constant to a display string.
+// There's an identical copy in oleddisplay.cpp (as a static function).
+// We could factor this into a shared header, but for a tiny switch 
+// statement the duplication is harmless and avoids creating a new 
+// module just for one helper.
+static const char* mode_to_string(uint8_t mode)
+{
+    switch (mode) {
+        case MANUAL:        return "MANU";    // 4 chars fit on 24px
+        case AUTO:          return "AUTO";
+        case OPT_SPEED:     return "SPEED";
+        case OPT_RAMPSPD:   return "RAMP";
+        case OPT_BEEP:      return "BEEP";
+        case OPT_PRES:      return "PRES";
+        case OPT_USER_MODE: return "MODE";
+        case STANDBY:       return "STANDBY";
+        default:            return "STANDBY";
+    }
+}
 
 // ============================================================
 // Global variable DEFINITIONS
@@ -55,7 +87,7 @@ void setup()
     button_init();
     motor_init();
     pressure_init();
-    nav_init();       // Set up 5-way navigation switch pins
+    nav_init();
 
     pinMode(BUTTPIN, INPUT);
 
@@ -71,8 +103,8 @@ void setup()
 
     display_init();
 
-    // Create display instance with default pins (CS=6, WR=7, DATA=8)
-    HT1632C_Display ledMatrix;
+    // Initialize the LED matrix — now using the file-scope instance
+    // instead of a local that would vanish after setup().
     ledMatrix.begin();
 
     // Recall saved settings from EEPROM
@@ -87,9 +119,19 @@ void setup()
 // ============================================================
 void loop()
 {
-    static uint8_t state = MANUAL;
+    static uint8_t state = STANDBY;
     static int sampleTick = 0;
     static unsigned long lastTick = 0;
+    static uint8_t nextState;
+    static NavDirection lastNavDir;
+
+    // Track previous state so we only redraw the matrix when 
+    // the mode actually changes. The HT1632C bit-bang write is 
+    // fast (~50µs for 48 bytes at Teensy 4.0 speeds), but 
+    // there's no point redrawing identical content 60 times 
+    // per second. This is the same idea as React's "only 
+    // re-render when state changes" philosophy.
+    static uint8_t lastDisplayedState = 255;  // Invalid initial value forces first draw
 
     if (millis() - lastTick >= UPDATE_PERIOD_MS) {
         lastTick = millis();
@@ -104,13 +146,53 @@ void loop()
         // Fade LED buffer (creates trailing light effect)
         fadeToBlackBy(leds, NUM_LEDS, 20);
 
-        // Handle button input and state transitions
-        uint8_t btnState = check_button();
-        state = set_state(btnState, state);
+        // DEPRECATE USE OF ENCODER BUTTON - Handle button input and state transitions
+        // uint8_t btnState = check_button();
+        // state = set_state(btnState, state);
+
+        // Run state machine 
         run_state_machine(state);
+        // Check if center has been pressed and set state to STANDBY if so
+        if (navDir == NAV_CENTER) {
+            state = STANDBY;
+        }
+        // Check if direction has been pressed and take action if so. 
+        // Be sure to only activate once when changing modes.
+        switch (navDir) {
+            case NAV_LEFT:
+                if (lastNavDir != NAV_LEFT) {
+                    nextState = get_previous_state(state);
+                    run_state_machine(nextState);
+                    lastNavDir = navDir;
+                }
+            case NAV_RIGHT:
+                if (lastNavDir != NAV_RIGHT) {
+                    nextState = get_next_state(state);
+                    run_state_machine(nextState);
+                    lastNavDir = navDir;
+                }
+            case NAV_UP:
+                if (lastNavDir != NAV_UP) {
+                    lastNavDir = navDir;
+                }
+            case NAV_DOWN:
+                if (lastNavDir != NAV_DOWN) {
+                    lastNavDir = navDir;
+                }
+            case NAV_CENTER: run_state_machine(STANDBY);
+            case NAV_NONE: ;
+        }
 
         // Push LED buffer to hardware
         FastLED.show();
+
+        // Update LED matrix when mode changes
+        if (state != lastDisplayedState) {
+            ledMatrix.clear();
+            ledMatrix.drawString(0, mode_to_string(state));
+            ledMatrix.flush();
+            lastDisplayedState = state;
+        }
         
         // Run OLED display update routine (now includes nav direction)
         display_update(state, motorSpeed, pressure, averagePressure, navDir);
