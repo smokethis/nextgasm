@@ -47,6 +47,19 @@ int cooldownFlag = 1;
 int maxCooldown = 180;
 int minimumcooldown = 1;
 
+// ── LED matrix display ─────────────────────────────────────────────────
+// 'static' at file scope means "visible only in this file" — like a
+// Python module-level variable with a leading underscore. It persists
+// for the lifetime of the program, unlike the local variable we had
+// before which died at the end of setup().
+static HT1632C_Display ledMatrix;
+
+// Throttle matrix updates separately from the OLED. The HT1632C is
+// faster than I2C (bit-banged at GPIO speed) but we still don't need
+// to refresh it every single 60Hz tick.
+constexpr unsigned long MATRIX_UPDATE_INTERVAL_MS = 50;  // 20Hz
+static unsigned long lastMatrixUpdate = 0;
+
 // ============================================================
 // Setup
 // ============================================================
@@ -55,7 +68,7 @@ void setup()
     button_init();
     motor_init();
     pressure_init();
-    nav_init();       // Set up 5-way navigation switch pins
+    nav_init();
 
     pinMode(BUTTPIN, INPUT);
 
@@ -71,9 +84,18 @@ void setup()
 
     display_init();
 
-    // Create display instance with default pins (CS=6, WR=7, DATA=8)
-    HT1632C_Display ledMatrix;
+    // Initialise the HT1632C LED matrix
     ledMatrix.begin();
+
+    // Brief startup test: fill all LEDs, pause, then clear.
+    // If you see the matrix flash fully lit then go dark, the
+    // wiring and initialisation are working correctly.
+    ledMatrix.fill();
+    ledMatrix.flush();
+    delay(500);
+    ledMatrix.clear();
+    ledMatrix.drawString(0, "READY");
+    ledMatrix.flush();
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -112,8 +134,34 @@ void loop()
         // Push LED buffer to hardware
         FastLED.show();
         
-        // Run OLED display update routine (now includes nav direction)
+        // Run OLED display update routine
         display_update(state, motorSpeed, pressure, averagePressure, navDir);
+
+        // ── LED matrix update ──────────────────────────────────────
+        // Show the nav switch direction on the matrix as a quick test.
+        // Later this will display arousal history, patterns, etc.
+        unsigned long now = millis();
+        if (now - lastMatrixUpdate >= MATRIX_UPDATE_INTERVAL_MS) {
+            lastMatrixUpdate = now;
+
+            ledMatrix.clear();
+
+            if (navDir != NAV_NONE) {
+                // Show direction name: "Up", "Down", "Left", etc.
+                // The 24-column display fits exactly 4 characters at
+                // 6 pixels each (5px char + 1px gap), so "Down" and
+                // "Left" fit perfectly, "Right" gets clipped to "Righ"
+                // and "Press" to "Pres" — fine for testing purposes.
+                ledMatrix.drawString(0, nav_direction_name(navDir));
+            } else {
+                // When nothing pressed, show a small idle dot in the
+                // center so you can tell the display is alive vs stuck.
+                // Column 12 (middle), row 4 (middle) — one lonely pixel.
+                ledMatrix.setPixel(12, 4);
+            }
+
+            ledMatrix.flush();
+        }
 
         // Warn if pressure sensor is railing (trimpot needs adjustment)
         if (pressure > 4030) beep_motor(2093, 2093, 2093);
