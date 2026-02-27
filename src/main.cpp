@@ -53,6 +53,7 @@
 #include "HT1632C_Display.h"
 #include "menu.h"
 #include "colour_lcd.h"
+#include "fire_effect.h"
 
 // ============================================================
 // File-scope objects
@@ -123,6 +124,7 @@ void setup()
     display_init();
     ledMatrix.begin();
     lcd_init();
+    fire_init();    // Seed the fire buffer
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -196,7 +198,7 @@ void loop()
                     motor_write(0);
                 }
             }
-            lcd_test_tick();
+            fire_tick();
             break;
         }
 

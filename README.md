@@ -7,22 +7,21 @@ with scope for additional input and display types.
 
 Based on code from [night-howler/protogasm](https://github.com/night-howler/protogasm).
 
-# Project Phases
+# Project Objectives
 
-Rough breakdown of the project phases:
+Rough breakdown of the project objectives, in order of priority:
 
-## Phase 1: Refactor
-The first phase of the project is to refactor the code to run on Teensy 4.0 hardware,
-with the same functionality as the original protogasm code.
+## Refactor
+The primary objective of the project is to refactor the code to run on Teensy 4.0 hardware, with the same functionality as the original protogasm code.
 
-## Phase 2: Additional Input and Display Types
-The second phase of the project is to add support for additional input and display types, such as buttons, 5-way controllers and OLED displays. Basic 
+## Additional Input and Display Types
+Adding support for additional input and display types, such as buttons, 5-way controllers and OLED displays.
 
-## Phase 3: Additional Sensors
-The third phase of the project is to add support for additional sensors, such as GSR and ECG.
+## Additional Sensors
+Adding support for additional sensors, such as GSR and ECG.
 
-## Phase 4: Additional Output Types
-The fourth phase of the project is to add support for additional output types, such as graphical animation and LED arrays.
+## Additional Output Types
+Adding support for additional output types, such as graphical animation and LED arrays.
 
-## Phase 5: Experimental Features
-The fifth phase of the project is to add support for experimental features, such as machine learning and biofeedback.
+## Experimental Features
+Adding support for experimental features, such as machine learning and biofeedback.
