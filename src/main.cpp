@@ -54,6 +54,9 @@
 #include "menu.h"
 #include "colour_lcd.h"
 #include "fire_effect.h"
+#include "matrix_graph.h"
+#include "sim_session.h"
+#include "alphanum_display.h"
 
 // ============================================================
 // File-scope objects
@@ -73,6 +76,178 @@ static const char* mode_to_string(uint8_t mode)
         case OPT_USER_MODE: return "MODE";
         case STANDBY:       return "STANDBY";
         default:            return "STANDBY";
+    }
+}
+
+// ── Alphanumeric display helper ────────────────────────────────────────
+// Shows the most useful at-a-glance debug value for each operational 
+// mode. This runs every tick — the HT16K33 handles it fine since 
+// the I2C transfer is only ~10 bytes (~0.2ms at 400kHz).
+//
+// What you see on the 4-digit display depends on which mode you're in:
+//   STANDBY:       "STBY"
+//   MANUAL:        "M" + motor speed as percentage (0-100)
+//   AUTO:          "d" + pressure delta (what triggers edge detection)
+//   OPT_SPEED:     "S" + current max speed setting (0-255)
+//   OPT_PRES:      "P" + raw pressure reading
+//   OPT_USER_MODE: "U" + current user mode number (1-6)
+//   Other:         "----"
+//
+// In Python terms, this is like a dictionary dispatch:
+//   display_map = {
+//       STANDBY: lambda: show_text("STBY"),
+//       MANUAL:  lambda: show_labeled('M', motor_pct),
+//       AUTO:    lambda: show_labeled('d', delta),
+//   }
+//   display_map.get(mode, lambda: show_text("----"))()
+
+static void alphanum_update_running(uint8_t mode)
+{
+    switch (mode) {
+        case STANDBY:
+            alphanum_show_text("STBY");
+            break;
+
+        case MANUAL:
+        {
+            // Show motor speed as a percentage (0-100%).
+            // More intuitive than raw 0-255 at a glance.
+            int speedPct = (int)(motorSpeed / MOT_MAX * 100);
+            alphanum_show_labeled('M', speedPct);
+            break;
+        }
+
+        case AUTO:
+        {
+            // Show pressure delta — this is THE key value for 
+            // understanding what the edging algorithm is seeing.
+            // When this exceeds pressureLimit, the motor cuts off.
+            int delta = pressure - averagePressure;
+            alphanum_show_labeled('d', delta);
+            break;
+        }
+
+        case OPT_SPEED:
+            alphanum_show_labeled('S', maxMotorSpeed);
+            break;
+
+        case OPT_PRES:
+        {
+            // Raw pressure — useful when adjusting the trimpot.
+            // Divides by 4 to fit in 3 digits (max ~1023).
+            int rawDisplay = analogRead(BUTTPIN) / 4;
+            alphanum_show_labeled('P', rawDisplay);
+            break;
+        }
+
+        case OPT_USER_MODE:
+            alphanum_show_labeled('U', userMode);
+            break;
+
+        default:
+            alphanum_show_text("----");
+            break;
+    }
+}
+
+// ── Alphanumeric display helper for demo mode ──────────────────────
+// Alternates between two "pages" on the 4-digit display:
+//
+//   Page 1 (3 seconds):  "A" + arousal value        e.g. "A 42"
+//   Page 2 (3 seconds):  "H" + BPM + dot on beat    e.g. "H 72" → "H 72."
+//
+// The dot on the last digit flashes for exactly one tick (1/60th 
+// second) when a simulated heartbeat occurs — a tiny visual pulse, 
+// like the LED on a heart rate monitor.
+//
+// The alternation uses a simple tick counter. At 60Hz and 3 seconds 
+// per page, each page shows for 180 ticks. In Python terms:
+//
+//   page = (tick_count // 180) % 2
+//   if page == 0: show_arousal()
+//   else:         show_heartrate_with_beat_dot()
+
+static void alphanum_demo_tick()
+{
+    // 'static' variables persist between calls — they're like 
+    // instance variables on a Python class. The tick counter keeps 
+    // counting across calls, driving the page alternation.
+    static unsigned int demoDisplayTick = 0;
+    demoDisplayTick++;
+
+    // ── Smoothed BPM for display ───────────────────────────────────
+    // The raw sim_bpm jitters by ±1-2 each tick, which makes the 
+    // number bounce distractingly on a 4-digit display. We smooth 
+    // it with an exponential moving average (EMA) — the same idea 
+    // as the pressure running average, but much simpler to implement.
+    //
+    // EMA formula:  smoothed = α × new + (1 - α) × smoothed
+    //
+    // α (alpha) controls how quickly the average responds to changes:
+    //   α = 1.0 → no smoothing (just the raw value)
+    //   α = 0.0 → never updates (stuck at initial value)
+    //   α ≈ 0.065 → roughly equivalent to averaging the last 30 samples
+    //
+    // Why 30 samples? At 60Hz, 30 samples = 500ms — enough to smooth 
+    // out tick-to-tick noise while still tracking genuine BPM changes 
+    // (which happen over seconds, not milliseconds).
+    //
+    // The equivalent in Python would be:
+    //   smoothed_bpm = 0.065 * sim_bpm + 0.935 * smoothed_bpm
+    //
+    // Unlike a simple moving average (which needs a buffer of N past 
+    // values), an EMA needs just one float. The tradeoff is that older 
+    // values never fully disappear — they just fade exponentially. For 
+    // display smoothing, that's actually ideal.
+    static float smoothedBpm = 0.0;
+    constexpr float BPM_ALPHA = 0.065;  // ≈ 2/(30+1), ~500ms window
+
+    // On first call, seed the EMA with the current value so it 
+    // doesn't have to "ramp up" from zero.
+    if (demoDisplayTick == 0) {
+        smoothedBpm = (float)sim_bpm;
+    } else {
+        smoothedBpm = BPM_ALPHA * sim_bpm + (1.0 - BPM_ALPHA) * smoothedBpm;
+    }
+
+    // 3 seconds per page at 60Hz = 180 ticks per page.
+    constexpr unsigned int TICKS_PER_PAGE = 180;
+    unsigned int page = (demoDisplayTick / TICKS_PER_PAGE) % 2;
+
+    if (sim_beat) {
+        alphanum_set_dot(0);
+    }
+
+    if (page == 0)
+    {
+        // ── Page 1: Arousal ────────────────────────────────────────
+        alphanum_show_labeled('A', sim_arousal);
+    }
+    else
+    {
+        // ── Page 2: Heart rate with beat indicator ─────────────────
+        // Show "H" + 3-digit BPM, then layer the dot on beat frames.
+        // alphanum_show_labeled writes all 4 digits and flushes.
+        // alphanum_set_dot adds the dot on top and re-flushes.
+        // Two I2C writes per beat frame (~0.4ms total) is negligible.
+        alphanum_show_labeled('H', (int)(smoothedBpm + 0.5));  // Round to nearest int
+    }
+    // ── Beat dot persistence ───────────────────────────────────────
+    // sim_beat is only true for one tick, but the dot needs to stay 
+    // visible long enough to actually see. We use a countdown: beat 
+    // sets it to N, then every tick we re-apply dots until it expires.
+    static int beatDotTimer = 0;
+
+    if (sim_beat) {
+        beatDotTimer = 4;
+    }
+
+    // Apply dots AFTER the character write so they survive the flush
+    if (beatDotTimer > 0) {
+        for (uint8_t i = 0; i < 4; i++) {
+            alphanum_set_dot(i);
+        }
+        beatDotTimer--;
     }
 }
 
@@ -123,8 +298,11 @@ void setup()
 
     display_init();
     ledMatrix.begin();
+    matrix_graph_init();
+    // sim_arousal_init();
     lcd_init();
     fire_init();    // Seed the fire buffer
+    alphanum_init();  // Quad alphanumeric display (I2C 0x70)
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -146,6 +324,9 @@ void loop()
 
     // ── Operational state (only matters when appState == APP_RUNNING) ──
     static uint8_t operationalState = STANDBY;
+
+    // -- Set up previousAppState and declare it to be APP_MENU
+    static AppState prevAppState = APP_MENU;
 
     // ── Shared loop state ──────────────────────────────────────────────
     static int sampleTick = 0;
@@ -180,9 +361,7 @@ void loop()
         {
             AppState nextAppState = menu_update(navDir);
             menu_render();
-            ledMatrix.clear();
-            ledMatrix.flush();
-            lcd_fill(0x0001);
+            alphanum_show_text("MENU");
 
             // If the menu told us to go somewhere, set up for it
             if (nextAppState != APP_MENU)
@@ -266,6 +445,7 @@ void loop()
             FastLED.show();
             ledMatrix.scrollText(mode_to_string(operationalState));
             display_update(operationalState, motorSpeed, pressure, averagePressure, navDir);
+            alphanum_update_running(operationalState);
 
             // Warn if pressure sensor is railing (trimpot needs adjustment)
             if (pressure > 4030) beep_motor(2093, 2093, 2093);
@@ -291,11 +471,12 @@ void loop()
             }
             display_message("SETTINGS", "Coming soon...");
             ledMatrix.scrollText("SETTINGS");
+            alphanum_show_text("SET");
             break;
         }
 
         // ────────────────────────────────────────────────────────────────
-        // DEMO / ATTRACT MODE (placeholder)
+        // DEMO / ATTRACT MODE
         // ────────────────────────────────────────────────────────────────
         // Will eventually run a simulated session across all displays 
         // and outputs. For now, just a placeholder screen.
@@ -307,12 +488,52 @@ void loop()
                 appState = APP_MENU;
                 break;
             }
-            display_message("DEMO", "Showing fire...");
-            ledMatrix.scrollText("DEMO");
+
+            display_message("DEMO", "Watch the screens...");
+            
+            // Show arousal value on OLED, deprecated for alphanumeric display
+            // char arousal[32];
+            // sprintf(arousal, "Arousal: %d", simDelta);
+            alphanum_demo_tick();
+            // Feed simulated arousal data to the matrix graph
+            matrix_graph_tick(sim_arousal, MAX_PRESSURE_LIMIT, ledMatrix);
+            
+            // Advance the simulation by one tick
+            sim_tick();
+
+            // Render fire to LCD
             fire_tick();
             break;
         }
     }
+
+    // --- Detect change of state and take one-time actions
+    if (appState != prevAppState)
+        // ── On-enter actions for the NEW state ─────────────────────
+        switch (appState)
+        {
+            case APP_MENU:
+                ledMatrix.clear();
+                ledMatrix.flush();
+                SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE3));
+                lcd_fill(0x0001);
+                SPI.endTransaction();
+                break;
+
+            case APP_RUNNING:
+                // could reset displays here too
+                break;
+
+            case APP_DEMO:
+                // reinit the sim, clear displays, etc.
+                break;
+
+            default:
+                break;
+        }
+    
+    // -- Update prevAppState to be current appState
+    prevAppState = appState;
 
     // ── Update edge detection state ────────────────────────────────────
     // This MUST happen after all the switch cases, so every case can 
