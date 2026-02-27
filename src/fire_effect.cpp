@@ -170,7 +170,7 @@ static const uint16_t firePalette[PALETTE_SIZE] = {
 // ...with fire_set_intensity() and fire_set_cooling() being the
 // @property setters.
 
-static uint8_t fireIntensity = PALETTE_SIZE - 1;  // Bottom row heat (0-36)
+static uint8_t fireIntensity = 13;  // Bottom row heat (0-36)
 static uint8_t fireMaxCooling = 3;                 // Upper bound for random cooling
 
 // ── Scaling constant ─────────────────────────────────────────────────
