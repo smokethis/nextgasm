@@ -54,6 +54,8 @@
 #include "menu.h"
 #include "colour_lcd.h"
 #include "fire_effect.h"
+#include "matrix_graph.h"
+#include "sim_session.h"
 
 // ============================================================
 // File-scope objects
@@ -123,6 +125,8 @@ void setup()
 
     display_init();
     ledMatrix.begin();
+    matrix_graph_init();
+    sim_arousal_init();
     lcd_init();
     fire_init();    // Seed the fire buffer
 
@@ -146,6 +150,9 @@ void loop()
 
     // ── Operational state (only matters when appState == APP_RUNNING) ──
     static uint8_t operationalState = STANDBY;
+
+    // -- Set up previousAppState and declare it to be APP_MENU
+    static AppState prevAppState = APP_MENU;
 
     // ── Shared loop state ──────────────────────────────────────────────
     static int sampleTick = 0;
@@ -180,9 +187,6 @@ void loop()
         {
             AppState nextAppState = menu_update(navDir);
             menu_render();
-            ledMatrix.clear();
-            ledMatrix.flush();
-            lcd_fill(0x0001);
 
             // If the menu told us to go somewhere, set up for it
             if (nextAppState != APP_MENU)
@@ -307,12 +311,51 @@ void loop()
                 appState = APP_MENU;
                 break;
             }
-            display_message("DEMO", "Showing fire...");
-            ledMatrix.scrollText("DEMO");
+
+            // Generate fake arousal data and feed it to the graph
+            int simMaxDelta = 600;  // Same scale as MAX_PRESSURE_LIMIT
+            int simDelta = sim_arousal_tick(simMaxDelta);
+            matrix_graph_tick(simDelta, simMaxDelta, ledMatrix);
+            char arousal[32];
+            sprintf(arousal, "Arousal: %d", simDelta);
+            display_message("DEMO", arousal);
+            matrix_graph_tick(
+                pressure - averagePressure,  // arousal delta
+                pressureLimit,               // scales bar height
+                ledMatrix
+            );
             fire_tick();
             break;
         }
     }
+
+    // --- Detect change of state and take one-time actions
+    if (appState != prevAppState)
+        // ── On-enter actions for the NEW state ─────────────────────
+        switch (appState)
+        {
+            case APP_MENU:
+                ledMatrix.clear();
+                ledMatrix.flush();
+                SPI.beginTransaction(SPISettings(24000000, MSBFIRST, SPI_MODE3));
+                lcd_fill(0x0001);
+                SPI.endTransaction();
+                break;
+
+            case APP_RUNNING:
+                // could reset displays here too
+                break;
+
+            case APP_DEMO:
+                // reinit the sim, clear displays, etc.
+                break;
+
+            default:
+                break;
+        }
+    
+    // -- Update prevAppState to be current appState
+    prevAppState = appState;
 
     // ── Update edge detection state ────────────────────────────────────
     // This MUST happen after all the switch cases, so every case can 
