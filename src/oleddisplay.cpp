@@ -216,17 +216,6 @@ void display_menu(const char* title, const char* items[], uint8_t itemCount, uin
         }
     }
 
-    // ── Navigation hint at bottom ──────────────────────────────────────
-    // Subtle reminder of controls. Small font, grey-ish (on a mono 
-    // display "grey" just means we draw it — could be dimmed with 
-    // setDrawColor in some modes, but keeping it simple for now).
-    // Navigation hint — using a font that includes arrow glyphs.
-    // The "_tf" suffix means "transparent, full range" (chars 0-255)
-    // vs "_tr" which only covers printable ASCII (32-127).
-    // 0x18 = ↑ and 0x19 = ↓ in the CP437 character set that U8g2 uses.
-    oleddisplay.setFont(u8g2_font_5x7_tf);
-    oleddisplay.drawStr(28, 63, "\x18\x19 Navigate  OK Select");
-
     oleddisplay.sendBuffer();
 }
 
@@ -263,9 +252,11 @@ void display_message(const char* title, const char* message)
     int msgWidth = oleddisplay.getStrWidth(message);
     oleddisplay.drawStr((128 - msgWidth) / 2, 44, message);
 
-    // Navigation hint
-    oleddisplay.setFont(u8g2_font_5x7_tf);
-    oleddisplay.drawStr(44, 63, "\x18 Back to menu");
+    // Navigation hint — plain text since the arrow glyphs in U8g2's 
+    // small fonts are unreliable (they're control characters in some 
+    // font builds and get silently skipped).
+    oleddisplay.setFont(u8g2_font_5x7_tr);
+    oleddisplay.drawStr(36, 63, "UP = Back to menu");
 
     oleddisplay.sendBuffer();
 }

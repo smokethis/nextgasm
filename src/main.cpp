@@ -158,7 +158,6 @@ void loop()
 
     // Edge detection: did the direction just change this tick?
     // This prevents held directions from firing repeatedly.
-    // In Python terms: navChanged = (navDir != lastNavDir)
     bool navChanged = (navDir != lastNavDir);
 
     // ── Dispatch based on app state ────────────────────────────────────
@@ -177,7 +176,8 @@ void loop()
         {
             AppState nextAppState = menu_update(navDir);
             menu_render();
-            ledMatrix.scrollText("NEXTGASM");
+            ledMatrix.clear();
+            ledMatrix.flush();
 
             // If the menu told us to go somewhere, set up for it
             if (nextAppState != APP_MENU)
