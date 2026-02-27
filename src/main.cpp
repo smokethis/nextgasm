@@ -182,6 +182,7 @@ void loop()
             menu_render();
             ledMatrix.clear();
             ledMatrix.flush();
+            lcd_fill(0x0001);
 
             // If the menu told us to go somewhere, set up for it
             if (nextAppState != APP_MENU)
@@ -198,7 +199,6 @@ void loop()
                     motor_write(0);
                 }
             }
-            fire_tick();
             break;
         }
 
@@ -307,8 +307,9 @@ void loop()
                 appState = APP_MENU;
                 break;
             }
-            display_message("DEMO", "Coming soon...");
+            display_message("DEMO", "Showing fire...");
             ledMatrix.scrollText("DEMO");
+            fire_tick();
             break;
         }
     }
