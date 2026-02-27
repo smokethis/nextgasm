@@ -74,3 +74,11 @@ void alphanum_clear();
 // Set brightness (0 = dimmest, 15 = brightest).
 // Default after init is 8 (mid-range).
 void alphanum_set_brightness(uint8_t level);
+
+// Light the decimal point on a specific digit (0-3) and re-flush.
+// Call AFTER alphanum_show_text/int/labeled — it adds the dot to 
+// whatever's already on screen without clearing the character.
+//
+// This is used for the heartbeat indicator in demo mode: show the 
+// BPM as text, then call this on beat frames to flash a dot.
+void alphanum_set_dot(uint8_t digit);

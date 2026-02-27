@@ -156,3 +156,29 @@ void alphanum_set_brightness(uint8_t level)
     if (level > 15) level = 15;
     alpha4.setBrightness(level);
 }
+
+
+void alphanum_set_dot(uint8_t digit)
+{
+    if (!displayReady || digit > 3) return;
+
+    // The Adafruit library stores each digit as a 16-bit value in 
+    // its displaybuffer[] array. Each bit maps to one segment of the 
+    // 14-segment display. Bit 14 is the decimal point.
+    //
+    // By OR-ing in that bit, we add the dot WITHOUT clearing the 
+    // character that's already there. Then we flush to hardware.
+    //
+    // In Python terms:
+    //   display.buffer[digit] |= (1 << 14)   # set the dot bit
+    //   display.flush()
+    //
+    // The displaybuffer is a public member of Adafruit_LEDBackpack 
+    // (the parent class of Adafruit_AlphaNum4), so we can access 
+    // it directly. This is one of those cases where reaching into 
+    // the library's internals is the cleanest solution.
+    for (uint8_t i = 0; i < 4; i++) {
+        alpha4.displaybuffer[i] |= (1 << 14);
+    }
+    alpha4.writeDisplay();  // Single I2C transaction
+}

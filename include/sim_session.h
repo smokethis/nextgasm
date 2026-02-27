@@ -1,43 +1,53 @@
-// sim_session.h — Simulated session signal for demo mode
+// sim_session.h — Simulated session data for demo mode
 //
-// Generates a fake but realistic-looking arousal delta signal that
-// mimics the actual edging cycle: gradual ramp → peak → sharp drop
-// → cooldown → repeat. Useful for testing displays and animations
-// without needing the pressure sensor connected.
+// Generates fake-but-convincing physiological data for driving all 
+// the displays during demo/attract mode. Everything updates together 
+// from a single tick function, keeping the simulation coherent across 
+// displays.
 //
-// The output is an integer in the same range as (pressure - averagePressure),
-// so it can be fed directly into matrix_graph_tick() or any other
-// visualisation that expects an arousal delta.
+// The simulation models an edging session:
+//   - Arousal ramps up gradually with small random fluctuations
+//   - When it hits a threshold, it "edges" — sharp drop, then restart
+//   - Heart rate loosely tracks arousal (resting ~65, elevated ~95)
+//   - Beat detection pulses true for one tick at the right BPM interval
 //
-// In Python terms, this is like:
+// In Python terms, the module is like:
 //
-//   class ArousalSimulator:
-//       def __init__(self):
-//           self.level = 0.0
-//           self.state = "ramping"
+//   class SimSession:
+//       arousal: float = 0
+//       bpm: int = 65
+//       beat_detected: bool = False
 //
-//       def tick(self) -> int:
-//           if self.state == "ramping":
-//               self.level += random_increment()
-//               if self.level > threshold:
-//                   self.state = "cooldown"
-//           elif self.state == "cooldown":
-//               self.level = 0
-//               ...
-//           return int(self.level)
+//       def tick(self):
+//           self.arousal += ramp_speed + noise()
+//           if self.arousal > threshold:
+//               self.arousal = 0   # edge!
+//           self.bpm = map(self.arousal, 0, max, 65, 95)
+//           self.beat_detected = (tick_count % beats_interval == 0)
+//
+// Usage:
+//   Call sim_tick() once per main loop tick (60Hz).
+//   Read the sim_* values from wherever you need them (displays, LEDs, etc).
 
 #pragma once
 
 #include <Arduino.h>
 
-// Reset the simulator state. Call once from setup() or when entering demo.
-void sim_arousal_init();
+// ── Simulated values ───────────────────────────────────────────────────
+// These are updated every time sim_tick() is called. Read them freely 
+// from any display module — they're stable between ticks.
 
-// Advance the simulation by one tick and return the current arousal delta.
-// Call once per main loop tick (~60Hz). The signal evolves smoothly 
-// between ticks — no need to call at a slower rate.
-//
-// maxDelta:  the ceiling value (like pressureLimit). The simulated 
-//            signal will peak near this value before dropping.
-//            Pass the same value to matrix_graph_tick() for proper scaling.
-int sim_arousal_tick(int maxDelta);
+extern int   sim_arousal;       // Pressure delta (0 to ~MAX_PRESSURE_LIMIT)
+extern int   sim_bpm;           // Heart rate in beats per minute (55–100)
+extern bool  sim_beat;          // True for exactly one tick when a "beat" occurs
+extern float sim_motor_speed;   // Simulated motor output (0–255), tracks arousal cycle
+
+// ── Control ────────────────────────────────────────────────────────────
+
+// Reset all simulation state. Call when entering demo mode so each 
+// demo session starts fresh from a "resting" baseline.
+void sim_reset();
+
+// Advance the simulation by one tick. Call once per 60Hz loop 
+// iteration when in demo mode.
+void sim_tick();

@@ -150,6 +150,107 @@ static void alphanum_update_running(uint8_t mode)
     }
 }
 
+// ── Alphanumeric display helper for demo mode ──────────────────────
+// Alternates between two "pages" on the 4-digit display:
+//
+//   Page 1 (3 seconds):  "A" + arousal value        e.g. "A 42"
+//   Page 2 (3 seconds):  "H" + BPM + dot on beat    e.g. "H 72" → "H 72."
+//
+// The dot on the last digit flashes for exactly one tick (1/60th 
+// second) when a simulated heartbeat occurs — a tiny visual pulse, 
+// like the LED on a heart rate monitor.
+//
+// The alternation uses a simple tick counter. At 60Hz and 3 seconds 
+// per page, each page shows for 180 ticks. In Python terms:
+//
+//   page = (tick_count // 180) % 2
+//   if page == 0: show_arousal()
+//   else:         show_heartrate_with_beat_dot()
+
+static void alphanum_demo_tick()
+{
+    // 'static' variables persist between calls — they're like 
+    // instance variables on a Python class. The tick counter keeps 
+    // counting across calls, driving the page alternation.
+    static unsigned int demoDisplayTick = 0;
+    demoDisplayTick++;
+
+    // ── Smoothed BPM for display ───────────────────────────────────
+    // The raw sim_bpm jitters by ±1-2 each tick, which makes the 
+    // number bounce distractingly on a 4-digit display. We smooth 
+    // it with an exponential moving average (EMA) — the same idea 
+    // as the pressure running average, but much simpler to implement.
+    //
+    // EMA formula:  smoothed = α × new + (1 - α) × smoothed
+    //
+    // α (alpha) controls how quickly the average responds to changes:
+    //   α = 1.0 → no smoothing (just the raw value)
+    //   α = 0.0 → never updates (stuck at initial value)
+    //   α ≈ 0.065 → roughly equivalent to averaging the last 30 samples
+    //
+    // Why 30 samples? At 60Hz, 30 samples = 500ms — enough to smooth 
+    // out tick-to-tick noise while still tracking genuine BPM changes 
+    // (which happen over seconds, not milliseconds).
+    //
+    // The equivalent in Python would be:
+    //   smoothed_bpm = 0.065 * sim_bpm + 0.935 * smoothed_bpm
+    //
+    // Unlike a simple moving average (which needs a buffer of N past 
+    // values), an EMA needs just one float. The tradeoff is that older 
+    // values never fully disappear — they just fade exponentially. For 
+    // display smoothing, that's actually ideal.
+    static float smoothedBpm = 0.0;
+    constexpr float BPM_ALPHA = 0.065;  // ≈ 2/(30+1), ~500ms window
+
+    // On first call, seed the EMA with the current value so it 
+    // doesn't have to "ramp up" from zero.
+    if (demoDisplayTick == 0) {
+        smoothedBpm = (float)sim_bpm;
+    } else {
+        smoothedBpm = BPM_ALPHA * sim_bpm + (1.0 - BPM_ALPHA) * smoothedBpm;
+    }
+
+    // 3 seconds per page at 60Hz = 180 ticks per page.
+    constexpr unsigned int TICKS_PER_PAGE = 180;
+    unsigned int page = (demoDisplayTick / TICKS_PER_PAGE) % 2;
+
+    if (sim_beat) {
+        alphanum_set_dot(0);
+    }
+
+    if (page == 0)
+    {
+        // ── Page 1: Arousal ────────────────────────────────────────
+        alphanum_show_labeled('A', sim_arousal);
+    }
+    else
+    {
+        // ── Page 2: Heart rate with beat indicator ─────────────────
+        // Show "H" + 3-digit BPM, then layer the dot on beat frames.
+        // alphanum_show_labeled writes all 4 digits and flushes.
+        // alphanum_set_dot adds the dot on top and re-flushes.
+        // Two I2C writes per beat frame (~0.4ms total) is negligible.
+        alphanum_show_labeled('H', (int)(smoothedBpm + 0.5));  // Round to nearest int
+    }
+    // ── Beat dot persistence ───────────────────────────────────────
+    // sim_beat is only true for one tick, but the dot needs to stay 
+    // visible long enough to actually see. We use a countdown: beat 
+    // sets it to N, then every tick we re-apply dots until it expires.
+    static int beatDotTimer = 0;
+
+    if (sim_beat) {
+        beatDotTimer = 4;
+    }
+
+    // Apply dots AFTER the character write so they survive the flush
+    if (beatDotTimer > 0) {
+        for (uint8_t i = 0; i < 4; i++) {
+            alphanum_set_dot(i);
+        }
+        beatDotTimer--;
+    }
+}
+
 // ============================================================
 // Global variable DEFINITIONS
 // ============================================================
@@ -198,7 +299,7 @@ void setup()
     display_init();
     ledMatrix.begin();
     matrix_graph_init();
-    sim_arousal_init();
+    // sim_arousal_init();
     lcd_init();
     fire_init();    // Seed the fire buffer
     alphanum_init();  // Quad alphanumeric display (I2C 0x70)
@@ -375,7 +476,7 @@ void loop()
         }
 
         // ────────────────────────────────────────────────────────────────
-        // DEMO / ATTRACT MODE (placeholder)
+        // DEMO / ATTRACT MODE
         // ────────────────────────────────────────────────────────────────
         // Will eventually run a simulated session across all displays 
         // and outputs. For now, just a placeholder screen.
@@ -388,22 +489,19 @@ void loop()
                 break;
             }
 
-            // Generate fake arousal data and feed it to the graph
-            int simMaxDelta = 600;  // Same scale as MAX_PRESSURE_LIMIT
-            int simDelta = sim_arousal_tick(simMaxDelta);
-            matrix_graph_tick(simDelta, simMaxDelta, ledMatrix);
-
             display_message("DEMO", "Watch the screens...");
             
             // Show arousal value on OLED, deprecated for alphanumeric display
             // char arousal[32];
             // sprintf(arousal, "Arousal: %d", simDelta);
-            alphanum_show_int(simDelta);
-            matrix_graph_tick(
-                pressure - averagePressure,  // arousal delta
-                pressureLimit,               // scales bar height
-                ledMatrix
-            );
+            alphanum_demo_tick();
+            // Feed simulated arousal data to the matrix graph
+            matrix_graph_tick(sim_arousal, MAX_PRESSURE_LIMIT, ledMatrix);
+            
+            // Advance the simulation by one tick
+            sim_tick();
+
+            // Render fire to LCD
             fire_tick();
             break;
         }

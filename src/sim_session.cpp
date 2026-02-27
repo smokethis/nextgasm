@@ -1,229 +1,219 @@
-// sim_arousal.cpp — Simulated arousal signal for demo mode
+// sim_session.cpp — Simulated session data for demo mode
 //
-// ═══════════════════════════════════════════════════════════════════════
-// WHY A STATE MACHINE AND NOT JUST A SINE WAVE?
-// ═══════════════════════════════════════════════════════════════════════
+// Models a simplified edging session with these interacting systems:
 //
-// A sine wave looks obviously artificial — perfectly smooth and 
-// symmetrical. Real arousal signals have very distinct phases:
+// ┌─────────────────────────────────────────────────────────────┐
+// │  AROUSAL CYCLE                                              │
+// │                                                             │
+// │  arousal  ╱╲      ╱╲        ╱╲                              │
+// │          ╱  │    ╱  │      ╱  │     ← sawtooth with noise   │
+// │         ╱   │   ╱   │     ╱   │                             │
+// │  ──────╱    │──╱    │────╱    │──── time                    │
+// │             ↓       ↓        ↓                              │
+// │           edge    edge     edge     ← sharp drop            │
+// │                                                             │
+// │  motor   ╱╲      ╱╲        ╱╲      ← follows arousal       │
+// │         ╱  ╲    ╱  ╲      ╱  ╲       but smoother ramp     │
+// │  ──────╱    ╲──╱    ╲────╱    ╲────                         │
+// │                                                             │
+// │  BPM    65→90  65→88  65→92        ← tracks arousal level   │
+// │                                                             │
+// │  beats  ♡ ♡ ♡ ♡♡♡♡ ♡ ♡ ♡♡♡♡       ← interval from BPM     │
+// └─────────────────────────────────────────────────────────────┘
 //
-//   1. RAMP:     Slow, wobbly climb. Not steady — there are moments 
-//                where it plateaus or dips slightly before continuing.
-//                Think of it like climbing a hill on a windy day.
+// The arousal value drives everything else. Heart rate is a simple 
+// linear mapping from arousal level, and beat detection is derived 
+// from the current BPM. This means all the displays stay coherent — 
+// when arousal is high, the heart beats faster, the motor is near 
+// max, and everything drops together when an "edge" is detected.
 //
-//   2. PLATEAU:  Near the peak, the signal bounces around for a few 
-//                seconds. This is the "approaching the edge" zone where
-//                the real device would be about to cut the motor.
-//
-//   3. DROP:     Sharp, fast fall — like a cliff, not a slope. This 
-//                mirrors the motor cutting off and arousal rapidly 
-//                decreasing.
-//
-//   4. COOLDOWN: Stays near zero for a while before the next ramp 
-//                begins. Duration varies randomly to keep it interesting.
-//
-// The state machine produces asymmetric, organic-looking waveforms 
-// that exercise the graph display much more realistically than any 
-// simple mathematical function would.
-//
-// ═══════════════════════════════════════════════════════════════════════
-// THE NOISE APPROACH
-// ═══════════════════════════════════════════════════════════════════════
-//
-// Rather than using Perlin noise (which would be overkill and heavy),
-// we use "smoothed random walk" — the level changes by a small random 
-// amount each tick, biased in the direction the current state wants to 
-// go. The small step size naturally creates smooth curves without any 
-// filtering. It's like a drunk person walking home — they wobble, but 
-// the general trend is toward the destination.
-//
-// In Python terms:
-//   step = random.uniform(-wobble, wobble) + bias
-//   level = clamp(level + step, 0, max)
+// RANDOMNESS:
+// We use random() for jitter, which is fine for demo visuals.
+// The seed comes from an unconnected analog pin read in sim_reset(),
+// so each demo session looks different. In Python terms, this is 
+// like calling random.seed(os.urandom(4)) — not cryptographic, 
+// but plenty for visual variety.
 
 #include "sim_session.h"
+#include "config.h"
 
-// ── Simulation states ──────────────────────────────────────────────────
-// Using an enum here rather than #defines (like the original protogasm 
-// code) because:
-//   1. The compiler enforces that you only use valid states
-//   2. Debuggers show "SIM_RAMP" instead of "0" in watch windows
-//   3. They're scoped — won't collide with MANUAL/AUTO/etc in config.h
-//
-// In Python you'd use an Enum class for the same reasons.
-enum SimState : uint8_t {
-    SIM_RAMP,       // Gradually increasing, with wobble
-    SIM_PLATEAU,    // Bouncing near the peak
-    SIM_DROP,       // Sharp fall
-    SIM_COOLDOWN    // Resting near zero before next cycle
-};
+// ── Public state (defined here, declared extern in header) ─────────
+int   sim_arousal     = 0;
+int   sim_bpm         = 65;
+bool  sim_beat        = false;
+float sim_motor_speed = 0;
 
-// ── Internal state ─────────────────────────────────────────────────────
-// 'static' file-scope variables — only visible in this .cpp file.
-// In Python terms: module-private (like _underscore convention).
+// ── Internal simulation state ──────────────────────────────────────
+// 'static' = file-private. These persist between tick() calls but 
+// aren't accessible from other modules.
 
-static SimState simState = SIM_RAMP;
-static float level = 0.0;           // Current simulated arousal (0.0 to ~maxDelta)
-static unsigned long stateEnteredAt = 0;   // millis() when current state began
-static unsigned long stateDuration = 0;    // How long to stay in current state (ms)
+static float arousalFloat    = 0.0;  // Smooth float for gradual ramping
+static float motorFloat      = 0.0;  // Smooth motor ramp (independent of arousal drop)
+static int   edgeThreshold   = 0;    // Arousal level that triggers an "edge"
+static int   cooldownTicks   = 0;    // Ticks remaining in post-edge cooldown
+static int   ticksSinceLastBeat = 0; // For timing the heartbeat pulses
 
-// ── Tuning constants ───────────────────────────────────────────────────
-// These control the "feel" of the simulation. Tweak to taste.
+// ── Tuning constants ───────────────────────────────────────────────
+// These control how the demo "feels". Tweak them if the pacing seems
+// off when watching it on the actual hardware.
 
-// RAMP: how fast the level climbs per tick
-// At 60Hz, 0.3/tick = ~18/sec. With maxDelta=600, a full ramp takes 
-// ~33 seconds, but the wobble adds +/- a few seconds of variance.
-constexpr float RAMP_BIAS = 0.8;
-constexpr float RAMP_WOBBLE = 0.5;   // Random jitter per tick
+// Arousal ramp speed: how many units of arousal per tick.
+// At 0.35/tick and threshold ~500, a full ramp takes ~24 seconds.
+// That's close to the real 30-second ramp with some acceleration.
+constexpr float AROUSAL_RAMP_BASE    = 0.35;
 
-// PLATEAU: bounces around near peak for this long
-constexpr unsigned long PLATEAU_MIN_MS = 2000;
-constexpr unsigned long PLATEAU_MAX_MS = 5000;
-constexpr float PLATEAU_WOBBLE = 1.5; // Bigger wobble = more drama at the peak
+// Random jitter added to each tick's ramp (±this value).
+// Makes the ramp look organic rather than perfectly linear.
+constexpr float AROUSAL_NOISE_RANGE  = 0.15;
 
-// DROP: how fast it falls per tick (much faster than ramp = asymmetric)
-constexpr float DROP_RATE = 8.0;
+// After an edge, arousal drops to this fraction of its peak.
+// Not quite zero — there's always some residual tension.
+constexpr float POST_EDGE_FLOOR      = 0.05;
 
-// COOLDOWN: rests near zero for this long
-constexpr unsigned long COOLDOWN_MIN_MS = 2000;
-constexpr unsigned long COOLDOWN_MAX_MS = 3000;
-constexpr float COOLDOWN_WOBBLE = 0.15; // Tiny wobble even at rest
+// Cooldown duration range (in ticks at 60Hz).
+// Random between these values — simulates the variable off-time.
+constexpr int COOLDOWN_MIN_TICKS     = 120;  // 2 seconds
+constexpr int COOLDOWN_MAX_TICKS     = 360;  // 6 seconds
 
-// What fraction of maxDelta triggers the transition to PLATEAU.
-// 0.75 means we start plateauing at 75% of the way up.
-constexpr float PEAK_THRESHOLD = 0.85;
+// Edge threshold range — varies per cycle for visual interest.
+constexpr int THRESHOLD_MIN          = 400;
+constexpr int THRESHOLD_MAX          = 580;
+
+// Heart rate range — maps linearly from arousal level.
+constexpr int BPM_RESTING            = 62;
+constexpr int BPM_ELEVATED           = 97;
+
+// Motor follows arousal but with its own ramp characteristics.
+constexpr float MOTOR_RAMP_RATE      = 0.18;  // Slower than arousal ramp
+constexpr float MOTOR_BACKOFF_RATE   = 0.6;   // Fast drop when ceiling falls
 
 
-// ── Helpers ────────────────────────────────────────────────────────────
-
-// Random float in range [lo, hi]. Arduino's random() returns a long 
-// in [0, max), so we scale it into a float range.
-//
-// This is equivalent to Python's random.uniform(lo, hi).
-//
-// The 1000-step granularity is plenty for our purposes — we're 
-// generating wobble, not cryptographic randomness.
-static float random_float(float lo, float hi)
+// ── Helper: pick a new random edge threshold ───────────────────────
+// Each cycle edges at a slightly different level, just like real 
+// sessions where sensitivity shifts over time.
+static void pick_new_threshold()
 {
-    return lo + (float)random(1000) / 1000.0 * (hi - lo);
-}
-
-// Enter a new state and optionally set a random duration for it.
-static void enter_state(SimState newState, unsigned long minMs = 0, unsigned long maxMs = 0)
-{
-    simState = newState;
-    stateEnteredAt = millis();
-    if (maxMs > 0) {
-        // random(min, max) returns a long in [min, max)
-        stateDuration = random(minMs, maxMs);
-    } else {
-        stateDuration = 0;  // Duration-less states (RAMP, DROP) exit by level, not time
-    }
+    edgeThreshold = random(THRESHOLD_MIN, THRESHOLD_MAX + 1);
 }
 
 
-// ════════════════════════════════════════════════════════════════════════
-// Public interface
-// ════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════
+// Reset
+// ════════════════════════════════════════════════════════════════════
 
-void sim_arousal_init()
+void sim_reset()
 {
-    level = 0.0;
-    // Seed the random number generator from an unconnected analog pin.
-    // analogRead() on a floating pin returns electrical noise, which
-    // makes a decent-enough random seed for our purposes. Without this,
-    // random() produces the same sequence every boot — the demo would 
-    // play the exact same "performance" each time.
+    // Seed the PRNG from an unconnected analog pin for variety.
+    // analogRead on a floating pin picks up electrical noise, giving 
+    // us a different-ish seed each time. Not great entropy, but fine 
+    // for demo visuals.
     //
-    // In Python terms: random.seed(os.urandom(...)) — but cruder.
+    // In Python: random.seed(int.from_bytes(os.urandom(2), 'big'))
     randomSeed(analogRead(A9));
-    enter_state(SIM_RAMP);
+
+    arousalFloat       = 0.0;
+    motorFloat         = 0.0;
+    sim_arousal        = 0;
+    sim_bpm            = BPM_RESTING;
+    sim_beat           = false;
+    sim_motor_speed    = 0;
+    cooldownTicks      = 0;
+    ticksSinceLastBeat = 0;
+
+    pick_new_threshold();
 }
 
 
-int sim_arousal_tick(int maxDelta)
+// ════════════════════════════════════════════════════════════════════
+// Tick — advance simulation by one 60Hz frame
+// ════════════════════════════════════════════════════════════════════
+
+void sim_tick()
 {
-    float peak = (float)maxDelta * PEAK_THRESHOLD;
-    unsigned long elapsed = millis() - stateEnteredAt;
+    // ── 1. AROUSAL RAMP ────────────────────────────────────────────
+    //
+    // During cooldown, arousal stays near the floor (with tiny drift).
+    // Otherwise, it ramps up with noise until hitting the threshold.
 
-    switch (simState)
+    if (cooldownTicks > 0)
     {
-        // ── RAMP: biased random walk upward ────────────────────────
-        // Each tick, add a small positive bias plus random wobble.
-        // The bias ensures we trend upward; the wobble makes it 
-        // organic. Occasionally the wobble wins and the level dips 
-        // slightly, which looks natural.
-        case SIM_RAMP:
+        // Post-edge cooldown: arousal drifts slowly near the floor.
+        // The tiny random walk keeps the display alive rather than 
+        // showing a static number.
+        cooldownTicks--;
+        arousalFloat += (random(-10, 11) / 100.0);  // ±0.1 drift
+        arousalFloat = max(arousalFloat, 0.0f);
+
+        // Motor stays off during cooldown
+        motorFloat -= MOTOR_BACKOFF_RATE;
+        if (motorFloat < 0) motorFloat = 0;
+    }
+    else
+    {
+        // Active ramping phase
+        float noise = (random(-100, 101) / 100.0) * AROUSAL_NOISE_RANGE;
+        arousalFloat += AROUSAL_RAMP_BASE + noise;
+
+        // Motor ramps up toward a ceiling proportional to arousal
+        float motorCeiling = (arousalFloat / edgeThreshold) * MOT_MAX;
+        motorCeiling = constrain(motorCeiling, 0, (float)MOT_MAX);
+
+        if (motorFloat < motorCeiling)
+            motorFloat += MOTOR_RAMP_RATE;
+        else if (motorFloat > motorCeiling)
+            motorFloat -= MOTOR_BACKOFF_RATE;
+
+        // ── EDGE DETECTION ─────────────────────────────────────────
+        if (arousalFloat >= edgeThreshold)
         {
-            float step = RAMP_BIAS + random_float(-RAMP_WOBBLE, RAMP_WOBBLE);
-            level += step;
-
-            // Clamp: don't go below zero during a dip
-            if (level < 0) level = 0;
-
-            // Transition: once we're near the peak, start plateauing
-            if (level >= peak) {
-                enter_state(SIM_PLATEAU, PLATEAU_MIN_MS, PLATEAU_MAX_MS);
-            }
-            break;
-        }
-
-        // ── PLATEAU: wobble near the peak ──────────────────────────
-        // Level bounces around the peak zone for a random duration.
-        // This is the tense moment before the "edge" — the graph 
-        // should show the bars flickering near max height.
-        case SIM_PLATEAU:
-        {
-            level += random_float(-PLATEAU_WOBBLE, PLATEAU_WOBBLE);
-
-            // Keep it in the peak zone (don't wander too far)
-            float ceiling = (float)maxDelta * 0.95;
-            float floor = (float)maxDelta * 0.55;
-            if (level > ceiling) level = ceiling;
-            if (level < floor)   level = floor;
-
-            // Transition: time's up, simulate the edge trigger
-            if (elapsed >= stateDuration) {
-                // Spike to near-max right before dropping — dramatic!
-                level = (float)maxDelta * random_float(0.85, 0.95);
-                enter_state(SIM_DROP);
-            }
-            break;
-        }
-
-        // ── DROP: rapid fall ───────────────────────────────────────
-        // Decreases much faster than it ramped up, creating the 
-        // characteristic asymmetric sawtooth shape. In the real 
-        // device, this is the motor cutting off and arousal quickly 
-        // subsiding.
-        case SIM_DROP:
-        {
-            level -= DROP_RATE;
-
-            // Transition: once we're near zero, enter cooldown
-            if (level <= 0) {
-                level = 0;
-                enter_state(SIM_COOLDOWN, COOLDOWN_MIN_MS, COOLDOWN_MAX_MS);
-            }
-            break;
-        }
-
-        // ── COOLDOWN: rest near zero ───────────────────────────────
-        // Tiny wobble to show the display is still alive, but 
-        // essentially flat. In the real device, this is the motor-off 
-        // period before ramping begins again.
-        case SIM_COOLDOWN:
-        {
-            level += random_float(-COOLDOWN_WOBBLE, COOLDOWN_WOBBLE);
-            if (level < 0) level = 0;
-
-            // Transition: cooldown elapsed, start the next ramp
-            if (elapsed >= stateDuration) {
-                enter_state(SIM_RAMP);
-            }
-            break;
+            // Edge hit! Sharp drop, enter cooldown.
+            arousalFloat = edgeThreshold * POST_EDGE_FLOOR;
+            motorFloat   = 0;
+            cooldownTicks = random(COOLDOWN_MIN_TICKS, COOLDOWN_MAX_TICKS + 1);
+            pick_new_threshold();  // Next cycle edges at a different level
         }
     }
 
-    return (int)level;
+    // Clamp and publish the integer version
+    sim_arousal     = constrain((int)arousalFloat, 0, MAX_PRESSURE_LIMIT);
+    sim_motor_speed = constrain(motorFloat, 0, (float)MOT_MAX);
+
+    // ── 2. HEART RATE ──────────────────────────────────────────────
+    //
+    // Linear mapping: more aroused → faster heartbeat.
+    // Plus a small random jitter so it doesn't look robotic.
+    //
+    // In Python terms:
+    //   base = lerp(BPM_RESTING, BPM_ELEVATED, arousal / threshold)
+    //   bpm = base + random.randint(-1, 1)
+
+    float arousalFraction = constrain(arousalFloat / THRESHOLD_MAX, 0.0f, 1.0f);
+    int baseBpm = BPM_RESTING + (int)(arousalFraction * (BPM_ELEVATED - BPM_RESTING));
+    sim_bpm = constrain(baseBpm + random(-1, 2), BPM_RESTING - 3, BPM_ELEVATED + 3);
+
+    // ── 3. BEAT DETECTION ──────────────────────────────────────────
+    //
+    // Calculate how many ticks between beats at the current BPM, 
+    // then pulse sim_beat for exactly one tick when that interval 
+    // elapses.
+    //
+    // At 70 BPM:  60/70 = 0.857 seconds × 60Hz = ~51 ticks/beat
+    // At 95 BPM:  60/95 = 0.632 seconds × 60Hz = ~38 ticks/beat
+    //
+    // We use integer division which gives us slight tempo variation 
+    // for free — the rounding error means beats aren't perfectly 
+    // metronomic, which actually looks more natural.
+
+    ticksSinceLastBeat++;
+    int ticksPerBeat = (60 * FREQUENCY) / sim_bpm;  // e.g. 3600 / 72 = 50
+
+    if (ticksSinceLastBeat >= ticksPerBeat)
+    {
+        sim_beat = true;
+        ticksSinceLastBeat = 0;
+    }
+    else
+    {
+        sim_beat = false;
+    }
 }
