@@ -88,3 +88,43 @@ void fire_init();
 // If DMA is still busy sending the last frame, this returns
 // immediately without doing anything (frame skip).
 void fire_tick();
+
+// ── Runtime parameter control ──────────────────────────────────────────
+//
+// These let external code (eventually GSR-driven) shape the fire's
+// character in real time. Think of them like the gas valve and burner
+// dial on a stove:
+//
+//   intensity = how much fuel (bottom row heat)
+//   cooling   = how fast the heat dissipates as it rises
+//
+// Together they control the fire's personality:
+//   Low intensity + high cooling  → small, flickery, calm
+//   High intensity + low cooling  → tall, roaring, intense
+//
+// Both take effect on the NEXT fire_tick() — no delay, no restart.
+// Safe to call from any context (main loop, ISR, etc).
+
+// Set the heat value for the bottom row (the "fuel source").
+// Range: 0 (no fire at all) to 36 (max white-hot).
+// Default after fire_init(): 36
+//
+// Lower values mean the fire starts from a cooler colour — dark red
+// instead of white — so the flames never reach the bright end of
+// the palette. This is the main "arousal level" knob.
+void fire_set_intensity(uint8_t heat);
+
+// Set the maximum random cooling per cell per tick.
+// Range: 1 (almost no cooling → very tall flames) to ~6 (aggressive
+// cooling → short, choppy flames). 0 would mean no cooling at all,
+// which makes the fire fill the entire screen solid.
+// Default after fire_init(): 3 (cooling of 0, 1, or 2 per tick)
+//
+// This shapes the flame HEIGHT and TEXTURE. Higher cooling makes
+// flames die quickly, giving a restless, nervous quality. Lower
+// cooling lets heat propagate further, giving tall lazy flames.
+void fire_set_cooling(uint8_t maxCooling);
+
+// Read back current values (useful for display/diagnostics).
+uint8_t fire_get_intensity();
+uint8_t fire_get_cooling();

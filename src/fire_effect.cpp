@@ -100,10 +100,6 @@ DMAMEM static uint16_t pixelBuf[2][LCD_PIXEL_COUNT];
 // while the CPU writes to pixelBuf[writeIndex] (the "back" buffer).
 static uint8_t writeIndex = 0;
 
-// ── Scaling constant ─────────────────────────────────────────────────
-// How many LCD pixels per fire cell in each dimension.
-constexpr uint8_t FIRE_SCALE = 4;
-
 // ── Palette (pre-swapped for DMA) ────────────────────────────────────
 //
 // 37 entries mapping heat (0-36) to byte-swapped RGB565 fire colours.
@@ -160,6 +156,27 @@ static const uint16_t firePalette[PALETTE_SIZE] = {
     RGB565_BE(0xFF, 0xFF, 0xFF),   // 36: pure white — the fuel source
 };
 
+// ── Tuneable parameters ──────────────────────────────────────────────
+// These are the "knobs" that external code can turn via the setter
+// functions. They're file-scope statics (module-private), with the
+// public API in fire_effect.h controlling access.
+//
+// In Python terms, these are like:
+//   class Fire:
+//       def __init__(self):
+//           self._intensity = 36
+//           self._max_cooling = 3
+//
+// ...with fire_set_intensity() and fire_set_cooling() being the
+// @property setters.
+
+static uint8_t fireIntensity = PALETTE_SIZE - 1;  // Bottom row heat (0-36)
+static uint8_t fireMaxCooling = 3;                 // Upper bound for random cooling
+
+// ── Scaling constant ─────────────────────────────────────────────────
+// How many LCD pixels per fire cell in each dimension.
+constexpr uint8_t FIRE_SCALE = 4;
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // Initialisation
@@ -170,9 +187,9 @@ void fire_init()
     // Clear simulation grid to zero (cold/black)
     memset(fireBuffer, 0, sizeof(fireBuffer));
 
-    // Seed the bottom row with maximum heat — the permanent fuel source
+    // Seed the bottom row with the current intensity setting
     for (int x = 0; x < FIRE_WIDTH; x++) {
-        FIRE_PIXEL(x, FIRE_HEIGHT - 1) = PALETTE_SIZE - 1;
+        FIRE_PIXEL(x, FIRE_HEIGHT - 1) = fireIntensity;
     }
 
     // Clear both pixel buffers to black (0x0000).
@@ -199,8 +216,11 @@ static void fire_step()
             // Read heat from the cell directly below
             uint8_t srcHeat = FIRE_PIXEL(x, y + 1);
 
-            // Random cooling: 0, 1, or 2 heat units lost
-            uint8_t cooling = random(0, 3);
+            // Random cooling: subtract 0 to (fireMaxCooling-1) heat units.
+            // This is what makes the flame taper off as it rises.
+            // Higher fireMaxCooling → more aggressive cooling → shorter flames.
+            // Controlled externally via fire_set_cooling().
+            uint8_t cooling = random(0, fireMaxCooling);
 
             // Random horizontal drift for organic wobble.
             // The & 3 maps random bits to 0-3, minus 1 gives -1 to +2.
@@ -303,6 +323,14 @@ void fire_tick()
     // The main loop carries on with everything else at full speed.
     if (lcd_frame_busy()) return;
 
+    // Refresh the bottom row with the current intensity.
+    // This runs every tick so changes to fireIntensity take effect
+    // immediately — the fire responds in real time to the setter.
+    // At 60 cells this is negligible (~0.001ms).
+    for (int x = 0; x < FIRE_WIDTH; x++) {
+        FIRE_PIXEL(x, FIRE_HEIGHT - 1) = fireIntensity;
+    }
+
     // Run the fire simulation
     fire_step();
 
@@ -323,4 +351,47 @@ void fire_tick()
     // In Python: writeIndex = 1 - writeIndex
     // Or equivalently: writeIndex ^= 1 (XOR toggle between 0 and 1)
     writeIndex = 1 - writeIndex;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Parameter control — setters and getters
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These are intentionally simple — just set a variable that fire_tick()
+// reads on the next iteration. No locking needed because:
+//   1. The main loop is single-threaded (no RTOS)
+//   2. Both the setter and fire_tick() run in the same loop context
+//   3. uint8_t writes are atomic on ARM (single byte store instruction)
+//
+// In Python terms, these are trivial property setters:
+//   @intensity.setter
+//   def intensity(self, value):
+//       self._intensity = min(value, 36)
+
+void fire_set_intensity(uint8_t heat)
+{
+    // Clamp to palette range. Values above PALETTE_SIZE-1 would index
+    // past the end of the palette array — undefined behaviour in C++
+    // (Python would raise IndexError, C++ just reads garbage memory).
+    if (heat >= PALETTE_SIZE) heat = PALETTE_SIZE - 1;
+    fireIntensity = heat;
+}
+
+void fire_set_cooling(uint8_t maxCooling)
+{
+    // Minimum of 1: random(0, 0) is undefined/pointless.
+    // In practice values above ~6 make the fire almost invisible.
+    if (maxCooling < 1) maxCooling = 1;
+    fireMaxCooling = maxCooling;
+}
+
+uint8_t fire_get_intensity()
+{
+    return fireIntensity;
+}
+
+uint8_t fire_get_cooling()
+{
+    return fireMaxCooling;
 }
