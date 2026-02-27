@@ -132,7 +132,7 @@ void menu_render()
         labels[i] = mainMenu[i].label;
     }
 
-    display_menu("NEXTGASM", labels, MENU_ITEM_COUNT, cursorPos);
+    display_menu("MENU", labels, MENU_ITEM_COUNT, cursorPos);
 }
 
 // ── Cursor reset ───────────────────────────────────────────────────────
