@@ -38,7 +38,7 @@ static U8G2_SH1106_128X64_NONAME_F_HW_I2C oleddisplay(U8G2_R0, U8X8_PIN_NONE);
 // display updates. Each full-frame I2C transfer takes ~10-30ms at 
 // 400kHz, which would eat into our 16ms tick budget. Throttling to 
 // 10Hz keeps updates snappy without starving other I/O.
-constexpr unsigned long DISPLAY_UPDATE_INTERVAL_MS = 100;  // 10Hz
+constexpr unsigned long DISPLAY_UPDATE_INTERVAL_MS = 50;  // 20Hz
 static unsigned long lastDisplayUpdate = 0;
 
 // Returns true if enough time has passed for a display refresh.
@@ -279,46 +279,147 @@ static constexpr uint8_t BAYER4[4][4] = {
 constexpr int DITHER_DEPTH = 15;
 
 // Display water effect in demo mode
+// Use full-buffer mode to reduce overhead of per-pixel drawing with the standard driver
 void display_demo_water(float gsr)
 {
-    // 'static float phase' persists between calls — this is our 
-    // time variable. Incrementing by a fixed amount each call gives 
-    // smooth animation. Like a Python class attribute that accumulates.
-    static float phase = 0.0f;
-    phase += 0.08f;  // Scroll speed (tune to taste at 10Hz)
-
     if (!display_throttle_check()) return;
 
-    oleddisplay.clearBuffer();
-    
-    // For each of the 128 columns, calculate where the water 
-    // surface sits, then fill every pixel below it.
+    static float phase = 0.0f;
+    phase += 0.15f;
+
+    static constexpr uint8_t BAYER4[4][4] = {
+        {  0,  8,  2, 10 },
+        { 12,  4, 14,  6 },
+        {  3, 11,  1,  9 },
+        { 15,  7, 13,  5 }
+    };
+    // Depth of the dithered area
+    constexpr int DITHER_DEPTH = 16;
+
+    // Get a raw pointer to U8g2's internal framebuffer.
+    // This is safe because we're in full-buffer ("F") mode — the 
+    // entire 1024-byte framebuffer lives in RAM and won't change 
+    // until we call sendBuffer().
+    //
+    // In Python terms, this is like getting a memoryview into a 
+    // bytearray — direct access, no copies, no overhead.
+    uint8_t* buf = oleddisplay.getBufferPtr();
+
+    // Clear the buffer manually — faster than clearBuffer() since 
+    // we already have the pointer. memset writes 1024 zeros in a 
+    // single burst on ARM (it uses optimised word-width stores).
+    memset(buf, 0, 1024);
+
     for (int x = 0; x < 128; x++)
     {
-        // Base water level — GSR lifts the water up the screen.
-        // Remember: Y=0 is TOP of the OLED, Y=63 is bottom.
-        // So a lower baseY number = higher water on screen.
-        float baseY = 52.0f - (gsr * 35.0f);  // Range: ~47 (rest) to ~22 (max)
+        float baseY = 52.0f - (gsr * 35.0f);
 
-        // Layer three sine waves with increasing frequency.
-        // Amplitude scales with GSR so calm = gentle, aroused = choppy.
+        // ── Edge damping envelope ──────────────────────────────────
+        // Taper amplitude near the "container walls" so waves don't 
+        // just scroll off the edges. The min() picks whichever edge 
+        // is closer, then we normalise to 0.0–1.0.
         //
-        // sin() returns -1 to +1, so multiplying by amplitude gives 
-        // the wave height in pixels. Same as Python's math.sin().
-        float wave1 = sinf(x * 0.05f + phase * 0.8f)  * (2.0f + gsr * 6.0f);
-        float wave2 = sinf(x * 0.12f + phase * 1.7f)  * (gsr * 5.0f);
-        float wave3 = sinf(x * 0.25f + phase * 3.1f)  * (fmaxf(0, gsr - 0.4f) * 5.0f);
+        // In Python: envelope = min(min(x, 127 - x) / 20.0, 1.0)
+        float distFromEdge = fminf((float)x, 127.0f - (float)x);
+        float envelope = fminf(distFromEdge / 20.0f, 1.0f);
 
-        // Surface position for this column
-        int surfaceY = (int)(baseY + wave1 + wave2 + wave3);
-        surfaceY = constrain(surfaceY, 0, 63);
+        // ── Standing wave components ───────────────────────────────
+        // 
+        // Each wave is sin(spatial) * cos(temporal) — the shape stays 
+        // in place while the height oscillates. Different temporal 
+        // frequencies for each layer so they don't all peak together.
+        //
+        // Layer 1: broad, slow swell — the main "slosh"
+        // Always present, like the fundamental mode of a bathtub.
+        float wave1 = sinf(x * 0.05f) * cosf(phase * 0.8f)
+                    * (2.0f + gsr * 6.0f);
 
-        // Fill from surface down to the bottom of the screen.
-        // drawVLine is the fastest way to fill a column in U8g2.
-        // In Python: for y in range(surfaceY, 64): set_pixel(x, y)
-        // But drawVLine does it in one call.
-        if (surfaceY < 64) {
-            oleddisplay.drawVLine(x, surfaceY, 64 - surfaceY);
+        // Layer 2: medium standing wave — adds complexity as GSR rises.
+        // Offset the spatial frequency so nodes don't align with wave1.
+        float wave2 = sinf(x * 0.11f) * cosf(phase * 1.4f)
+                    * (gsr * 5.0f);
+
+        // Layer 3: fast ripple — turbulence at high GSR.
+        // This one stays as a TRAVELLING wave: sin(kx + wt).
+        // A small amount of horizontal drift in the chop layer 
+        // prevents the surface from looking too symmetrical and 
+        // "frozen". It's like the difference between a pool with 
+        // a gentle breeze (some drift) vs a perfectly still basin.
+        float wave3 = sinf(x * 0.25f + phase * 2.5f)
+                    * (fmaxf(0, gsr - 0.4f) * 4.0f);
+
+        // Combine with envelope damping.
+        // The broad waves get full damping (they "respect" the walls).
+        // The fine ripple gets less damping — choppy turbulence can 
+        // splash right up to the edges, which looks natural.
+        float surface = (wave1 + wave2) * envelope
+                    + wave3 * fminf(envelope * 2.0f, 1.0f);
+
+        int surfaceY = constrain((int)(baseY + surface), 0, 63);
+
+        // ── Fill column with dithered water, one page at a time ──
+        // 
+        // Instead of calling drawPixel 40+ times per column, we 
+        // process 8 rows at once (one "page"). For each page, we 
+        // build a byte where each bit = one pixel, then write the 
+        // whole byte in one shot.
+        //
+        // Three cases per page:
+        //   1. Entirely above surface → skip (byte stays 0x00)
+        //   2. Entirely below surface AND past dither zone → 0xFF
+        //   3. Partially in the dither zone → compute per-bit
+
+        for (int page = 0; page < 8; page++)
+        {
+            int pageTopY = page * 8;    // First row in this page
+            int pageBotY = pageTopY + 7; // Last row in this page
+
+            // Case 1: whole page is above the waterline — nothing to draw
+            if (pageBotY < surfaceY) continue;
+
+            // Case 2: whole page is deep underwater (past dither zone)
+            // — solid fill, just write 0xFF. No per-pixel math needed.
+            if (pageTopY >= surfaceY + DITHER_DEPTH)
+            {
+                buf[page * 128 + x] = 0xFF;
+                continue;
+            }
+
+            // Case 3: this page straddles the surface or dither zone.
+            // Build the byte bit by bit.
+            uint8_t columnByte = 0;
+
+            for (int bit = 0; bit < 8; bit++)
+            {
+                int y = pageTopY + bit;
+
+                // Above the surface — pixel stays off
+                if (y < surfaceY) continue;
+
+                int depth = y - surfaceY;
+
+                if (depth >= DITHER_DEPTH)
+                {
+                    // Past dither zone — this bit and all below are solid.
+                    // Fill remaining bits in one go with a bitmask.
+                    //
+                    // (0xFF << bit) sets all bits from 'bit' upward.
+                    // e.g. if bit=3: 0xFF << 3 = 0b11111000
+                    //
+                    // In Python: column_byte |= (0xFF << bit) & 0xFF
+                    columnByte |= (0xFF << bit);
+                    break;  // No need to check remaining bits
+                }
+
+                // In the dither zone — check against Bayer threshold
+                int brightness = (depth + 1) * 15 / DITHER_DEPTH;
+                if (brightness > BAYER4[y & 3][x & 3])
+                {
+                    columnByte |= (1 << bit);
+                }
+            }
+
+            buf[page * 128 + x] = columnByte;
         }
     }
 
