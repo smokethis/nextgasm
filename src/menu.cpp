@@ -81,7 +81,7 @@ AppState menu_update(NavDirection dir)
         return APP_MENU;  // No change, stay in menu
     }
 
-    NavDirection previousDir = lastNavDir;
+    // NavDirection previousDir = lastNavDir;
     lastNavDir = dir;
 
     // Ignore releases (NAV_NONE) — we only care about new presses

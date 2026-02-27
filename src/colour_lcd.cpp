@@ -297,25 +297,48 @@ void lcd_init()
 // ═══════════════════════════════════════════════════════════════════════
 // Fill screen — uses bulk streaming for speed
 // ═══════════════════════════════════════════════════════════════════════
-//
-// Performance comparison for 240×280 = 67,200 pixels:
-//
-//   CS-per-pixel + digitalWrite @ 8MHz:  ~200ms (what you just saw)
-//   Bulk stream + digitalWriteFast @ 24MHz: ~12ms (this version)
-//
-// The speedup comes from two things:
-//   1. No CS toggle per pixel (saves ~134,400 pin transitions)
-//   2. 3× faster SPI clock (24MHz vs 8MHz)
 
 void lcd_fill(uint16_t colour)
 {
     lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
 
-    // Stream all pixels with CS held low
     lcd_bulk_start();
     for (uint32_t i = 0; i < (uint32_t)LCD_WIDTH * LCD_HEIGHT; i++) {
         lcd_bulk_pixel(colour);
     }
+    lcd_bulk_end();
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// Public bulk drawing API
+// ═══════════════════════════════════════════════════════════════════════
+//
+// These wrap the internal static functions so other modules (like the 
+// fire effect) can push pixel data without duplicating SPI logic.
+//
+// In Python terms, these are like making private methods public via 
+// a clean interface — the internal _lcd_bulk_start() stays private,
+// but lcd_begin_draw() is the public wrapper that also handles the 
+// window setup.
+
+void lcd_begin_draw(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
+{
+    lcd_set_window(x0, y0, x1, y1);
+    lcd_bulk_start();
+}
+
+void lcd_push_pixel(uint16_t colour)
+{
+    // Just a passthrough — but having it as a named public function 
+    // means the fire module doesn't need to know about SPI internals.
+    // If we later switch to DMA or buffered writes, only this function 
+    // changes. The fire module stays untouched.
+    lcd_bulk_pixel(colour);
+}
+
+void lcd_end_draw()
+{
     lcd_bulk_end();
 }
 
