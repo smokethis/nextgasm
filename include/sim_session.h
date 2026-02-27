@@ -42,6 +42,21 @@ extern int   sim_bpm;           // Heart rate in beats per minute (55–100)
 extern bool  sim_beat;          // True for exactly one tick when a "beat" occurs
 extern float sim_motor_speed;   // Simulated motor output (0–255), tracks arousal cycle
 
+// GSR output: normalised 0.0–1.0, combining tonic baseline and 
+// phasic (event-triggered) components. Unlike arousal, GSR has 
+// significant inertia — it rises slowly and falls even slower,
+// accumulating over repeated edge cycles.
+//
+// Timescale comparison:
+//   arousal:  seconds      (ramps in ~24s, drops instantly)
+//   BPM:     sub-second   (tracks arousal within one beat)
+//   GSR:     tens of secs  (tonic drifts over minutes, 
+//                           phasic spikes decay over ~10s)
+extern float sim_gsr;           // Combined output (0.0 – 1.0)
+extern float sim_gsr_phasic;    // Just the spike component (for displays
+                                // that want to show "event reactivity"
+                                // separately from baseline)
+
 // ── Control ────────────────────────────────────────────────────────────
 
 // Reset all simulation state. Call when entering demo mode so each 

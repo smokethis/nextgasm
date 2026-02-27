@@ -251,6 +251,33 @@ static void alphanum_demo_tick()
     }
 }
 
+// ── Fire heartbeat helper ──────────────────────
+// Adds heat to the fire displayed on every heartbeat.
+//
+static void add_heat() {
+
+    static float beatHeat = 0.0f;
+
+    // When the sim pulses a beat, inject heat
+    if (sim_beat) {
+        beatHeat += 6.0f;           // The "bump" — tune this for visual punch
+    }
+
+    // Exponential decay every tick — the heat fades smoothly between beats
+    // At 0.92 per tick and 60Hz, the half-life is about 8 ticks (~130ms),
+    // so the pulse is visible but doesn't linger past the next beat.
+    beatHeat *= 0.92f;
+
+    // Baseline fire intensity tracks arousal (slow timescale)
+    // map() does linear interpolation: arousal 0→600 becomes heat 8→24
+    float baseline = map(constrain(sim_arousal, 0, 600), 0, 600, 8, 24);
+
+    // Combine and clamp to palette range (0–36)
+    uint8_t totalHeat = constrain((int)(baseline + beatHeat + 0.5f), 0, 36);
+    fire_set_intensity(totalHeat);
+
+}
+
 // ============================================================
 // Global variable DEFINITIONS
 // ============================================================
@@ -502,6 +529,7 @@ void loop()
             sim_tick();
 
             // Render fire to LCD
+            add_heat();
             fire_tick();
             break;
         }

@@ -19,6 +19,9 @@
 // │  BPM    65→90  65→88  65→92        ← tracks arousal level   │
 // │                                                             │
 // │  beats  ♡ ♡ ♡ ♡♡♡♡ ♡ ♡ ♡♡♡♡       ← interval from BPM     │
+// │                                                             │
+// │  GSR    ╱‾‾‾↑‾‾╲___╱‾‾‾↑‾‾‾╲____    ← ratcheting baseline    │
+// │              edge       edge          with spikes at edges   │
 // └─────────────────────────────────────────────────────────────┘
 //
 // The arousal value drives everything else. Heart rate is a simple 
@@ -51,6 +54,7 @@ static float arousalFloat    = 0.0;  // Smooth float for gradual ramping
 static float motorFloat      = 0.0;  // Smooth motor ramp (independent of arousal drop)
 static int   edgeThreshold   = 0;    // Arousal level that triggers an "edge"
 static int   cooldownTicks   = 0;    // Ticks remaining in post-edge cooldown
+static bool edgeJustFired = false; // Did we just reach an edge?
 static int   ticksSinceLastBeat = 0; // For timing the heartbeat pulses
 
 // ── Tuning constants ───────────────────────────────────────────────
@@ -87,6 +91,47 @@ constexpr int BPM_ELEVATED           = 97;
 constexpr float MOTOR_RAMP_RATE      = 0.18;  // Slower than arousal ramp
 constexpr float MOTOR_BACKOFF_RATE   = 0.6;   // Fast drop when ceiling falls
 
+// ── Public GSR state ───────────────────────────────────────────────
+float sim_gsr         = 0.0;
+float sim_gsr_phasic  = 0.0;
+
+// ── Internal GSR state ─────────────────────────────────────────────
+static float gsrTonic   = 0.0;   // Slow-moving baseline
+static float gsrPhasic  = 0.0;   // Fast-attack, slow-decay spike
+
+// ── GSR tuning constants ───────────────────────────────────────────
+//
+// These are chosen to approximate real electrodermal timing.
+// Real GSR research uses terms like "skin conductance level" (SCL)
+// for tonic and "skin conductance response" (SCR) for phasic.
+
+// How fast the tonic baseline tracks arousal.
+// 0.001 at 60Hz ≈ 17-second effective window — very sluggish,
+// like heating a cast-iron pan.
+constexpr float GSR_TONIC_ALPHA     = 0.001;
+
+// Tonic output range: even at rest there's some baseline
+// conductance, and it never quite reaches 1.0 from tonic alone.
+constexpr float GSR_TONIC_FLOOR     = 0.15;
+constexpr float GSR_TONIC_CEILING   = 0.70;
+
+// How much a single edge event kicks the phasic component.
+// Think of this as the "startle response" magnitude.
+constexpr float GSR_PHASIC_KICK     = 0.25;
+
+// Phasic decay rate per tick. 0.993 at 60Hz gives a half-life
+// of about 100 ticks ≈ 1.7 seconds. The tail lingers for ~10
+// seconds before becoming negligible.
+//
+// Math: half-life = ln(0.5) / ln(decay) = -0.693 / ln(0.993)
+//     = -0.693 / -0.00702 ≈ 99 ticks
+//
+// In Python: import math; math.log(0.5) / math.log(0.993) → ~98.7
+constexpr float GSR_PHASIC_DECAY    = 0.993;
+
+// Tiny noise amplitude for organic texture
+constexpr float GSR_NOISE_RANGE     = 0.005;
+
 
 // ── Helper: pick a new random edge threshold ───────────────────────
 // Each cycle edges at a slightly different level, just like real 
@@ -119,6 +164,10 @@ void sim_reset()
     sim_motor_speed    = 0;
     cooldownTicks      = 0;
     ticksSinceLastBeat = 0;
+    gsrTonic           = GSR_TONIC_FLOOR;  // Start at resting baseline, not zero
+    gsrPhasic          = 0.0;
+    sim_gsr            = GSR_TONIC_FLOOR;
+    sim_gsr_phasic     = 0.0;
 
     pick_new_threshold();
 }
@@ -170,6 +219,7 @@ void sim_tick()
             arousalFloat = edgeThreshold * POST_EDGE_FLOOR;
             motorFloat   = 0;
             cooldownTicks = random(COOLDOWN_MIN_TICKS, COOLDOWN_MAX_TICKS + 1);
+            edgeJustFired = true;
             pick_new_threshold();  // Next cycle edges at a different level
         }
     }
@@ -216,4 +266,39 @@ void sim_tick()
     {
         sim_beat = false;
     }
+
+    // ── 4. GSR (GALVANIC SKIN RESPONSE) ────────────────────────────
+    //
+    // Two-layer model: slow tonic baseline + fast phasic spikes.
+    //
+    // Unlike arousal and BPM which drop at the edge, GSR *spikes*
+    // — the sympathetic nervous system fires harder at the moment
+    // of the edge (it's a stress/surprise event). Then it decays
+    // very slowly. After several cycles, the tonic level has 
+    // ratcheted up even though arousal resets each time.
+    //
+    // This gives you a signal that encodes "session depth" — 
+    // something no other simulated channel captures.
+
+    // Tonic: sluggishly track a target derived from arousal level.
+    float tonicTarget = GSR_TONIC_FLOOR 
+                      + arousalFraction * (GSR_TONIC_CEILING - GSR_TONIC_FLOOR);
+    gsrTonic += GSR_TONIC_ALPHA * (tonicTarget - gsrTonic);
+
+    // Phasic: spike on edge, then decay exponentially.
+    // 'edgeJustFired' is set to true in the edge detection block above,
+    // then consumed here and reset.
+    if (edgeJustFired) {
+        gsrPhasic += GSR_PHASIC_KICK;
+        edgeJustFired = false;  // Consume the event
+    }
+    gsrPhasic *= GSR_PHASIC_DECAY;
+
+    // Combine with noise and clamp
+    float gsrNoise = (random(-100, 101) / 100.0f) * GSR_NOISE_RANGE;
+    float gsrRaw = gsrTonic + gsrPhasic + gsrNoise;
+
+    // Publish
+    sim_gsr        = constrain(gsrRaw, 0.0f, 1.0f);
+    sim_gsr_phasic = constrain(gsrPhasic, 0.0f, 1.0f);
 }
