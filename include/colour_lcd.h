@@ -1,26 +1,44 @@
-// colour_lcd.h — ST7789V2 colour LCD interface
+// colour_lcd.h — Waveshare 1.69" ST7789V2 colour LCD interface
 //
-// Drives a Waveshare 1.69" 240x280 colour LCD over SPI.
-// For now this is just a test module to verify the wiring works —
-// it cycles through solid red, green, blue fills.
+// Driver based on Waveshare's official Arduino demo code, adapted
+// for Teensy 4.0 with raw SPI. Confirmed working 2026-02-27 after
+// discovering a broken CLK cable on the display module.
 //
-// The ST7789V2 is an SPI device, which means it shares the SPI bus 
-// with any other SPI peripherals you add later (e.g. an SD card).
-// Each SPI device gets its own CS (Chip Select) pin — pulling CS LOW 
-// tells that specific device "listen up, this data is for you."
-// When CS is HIGH, the device ignores everything on the bus.
+// Display: 240×280 pixels, RGB565, IPS panel
+// Controller: ST7789V2
+// Interface: SPI_MODE3 with separate DC (data/command) pin
 //
-// In Python terms, SPI is like a shared radio channel where CS is 
-// each device's name — you call their name before speaking to them.
+// Hardware notes:
+//   - Requires SPI_MODE3 (CPOL=1, CPHA=1)
+//   - Init commands need CS toggled per-byte (acts as latch)
+//   - Bulk pixel data can be streamed with CS held low
+//   - Full power/gamma init sequence required (not minimal ST7789)
 
 #pragma once
 
 #include <Arduino.h>
 
-// Initialise the display hardware. Call once from setup().
-void colour_lcd_init();
+// ── Pin assignments ────────────────────────────────────────────────────
+// CS is software-controlled (not hardware SPI CS on pin 10, which is
+// used by NeoPixels). DC and RST on adjacent pins for tidy wiring.
+constexpr uint8_t LCD_PIN_CS  = 4;   // Software chip select
+constexpr uint8_t LCD_PIN_DC  = 22;  // Data/Command select
+constexpr uint8_t LCD_PIN_RST = 23;  // Hardware reset
+// BL (backlight) tied directly to 3.3V — no PWM control for now.
 
-// Call this from the main loop. It manages its own timing internally
-// and flips to the next colour when enough time has elapsed.
-// Safe to call every tick — it only redraws when it's time.
-void colour_lcd_test_tick();
+// ── Display dimensions ─────────────────────────────────────────────────
+constexpr uint16_t LCD_WIDTH  = 240;
+constexpr uint16_t LCD_HEIGHT = 280;
+
+// ── Public interface ───────────────────────────────────────────────────
+
+// Initialize SPI, reset the display, run the full Waveshare init
+// sequence, and clear to black. Call once from setup().
+void lcd_init();
+
+// Fill the entire screen with a single RGB565 colour.
+void lcd_fill(uint16_t colour);
+
+// Diagnostic: cycle through solid colours every ~1 second.
+// Call from loop() — manages its own timing internally.
+void lcd_test_tick();

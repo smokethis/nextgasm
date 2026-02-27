@@ -122,7 +122,7 @@ void setup()
 
     display_init();
     ledMatrix.begin();
-    colour_lcd_init();
+    lcd_init();
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -196,7 +196,7 @@ void loop()
                     motor_write(0);
                 }
             }
-            colour_lcd_test_tick();
+            lcd_test_tick();
             break;
         }
 
