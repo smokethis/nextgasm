@@ -56,6 +56,7 @@
 #include "fire_effect.h"
 #include "matrix_graph.h"
 #include "sim_session.h"
+#include "alphanum_display.h"
 
 // ============================================================
 // File-scope objects
@@ -75,6 +76,77 @@ static const char* mode_to_string(uint8_t mode)
         case OPT_USER_MODE: return "MODE";
         case STANDBY:       return "STANDBY";
         default:            return "STANDBY";
+    }
+}
+
+// ── Alphanumeric display helper ────────────────────────────────────────
+// Shows the most useful at-a-glance debug value for each operational 
+// mode. This runs every tick — the HT16K33 handles it fine since 
+// the I2C transfer is only ~10 bytes (~0.2ms at 400kHz).
+//
+// What you see on the 4-digit display depends on which mode you're in:
+//   STANDBY:       "STBY"
+//   MANUAL:        "M" + motor speed as percentage (0-100)
+//   AUTO:          "d" + pressure delta (what triggers edge detection)
+//   OPT_SPEED:     "S" + current max speed setting (0-255)
+//   OPT_PRES:      "P" + raw pressure reading
+//   OPT_USER_MODE: "U" + current user mode number (1-6)
+//   Other:         "----"
+//
+// In Python terms, this is like a dictionary dispatch:
+//   display_map = {
+//       STANDBY: lambda: show_text("STBY"),
+//       MANUAL:  lambda: show_labeled('M', motor_pct),
+//       AUTO:    lambda: show_labeled('d', delta),
+//   }
+//   display_map.get(mode, lambda: show_text("----"))()
+
+static void alphanum_update_running(uint8_t mode)
+{
+    switch (mode) {
+        case STANDBY:
+            alphanum_show_text("STBY");
+            break;
+
+        case MANUAL:
+        {
+            // Show motor speed as a percentage (0-100%).
+            // More intuitive than raw 0-255 at a glance.
+            int speedPct = (int)(motorSpeed / MOT_MAX * 100);
+            alphanum_show_labeled('M', speedPct);
+            break;
+        }
+
+        case AUTO:
+        {
+            // Show pressure delta — this is THE key value for 
+            // understanding what the edging algorithm is seeing.
+            // When this exceeds pressureLimit, the motor cuts off.
+            int delta = pressure - averagePressure;
+            alphanum_show_labeled('d', delta);
+            break;
+        }
+
+        case OPT_SPEED:
+            alphanum_show_labeled('S', maxMotorSpeed);
+            break;
+
+        case OPT_PRES:
+        {
+            // Raw pressure — useful when adjusting the trimpot.
+            // Divides by 4 to fit in 3 digits (max ~1023).
+            int rawDisplay = analogRead(BUTTPIN) / 4;
+            alphanum_show_labeled('P', rawDisplay);
+            break;
+        }
+
+        case OPT_USER_MODE:
+            alphanum_show_labeled('U', userMode);
+            break;
+
+        default:
+            alphanum_show_text("----");
+            break;
     }
 }
 
@@ -129,6 +201,7 @@ void setup()
     sim_arousal_init();
     lcd_init();
     fire_init();    // Seed the fire buffer
+    alphanum_init();  // Quad alphanumeric display (I2C 0x70)
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -187,6 +260,7 @@ void loop()
         {
             AppState nextAppState = menu_update(navDir);
             menu_render();
+            alphanum_show_text("MENU");
 
             // If the menu told us to go somewhere, set up for it
             if (nextAppState != APP_MENU)
@@ -270,6 +344,7 @@ void loop()
             FastLED.show();
             ledMatrix.scrollText(mode_to_string(operationalState));
             display_update(operationalState, motorSpeed, pressure, averagePressure, navDir);
+            alphanum_update_running(operationalState);
 
             // Warn if pressure sensor is railing (trimpot needs adjustment)
             if (pressure > 4030) beep_motor(2093, 2093, 2093);
@@ -295,6 +370,7 @@ void loop()
             }
             display_message("SETTINGS", "Coming soon...");
             ledMatrix.scrollText("SETTINGS");
+            alphanum_show_text("SET");
             break;
         }
 
@@ -316,9 +392,13 @@ void loop()
             int simMaxDelta = 600;  // Same scale as MAX_PRESSURE_LIMIT
             int simDelta = sim_arousal_tick(simMaxDelta);
             matrix_graph_tick(simDelta, simMaxDelta, ledMatrix);
-            char arousal[32];
-            sprintf(arousal, "Arousal: %d", simDelta);
-            display_message("DEMO", arousal);
+
+            display_message("DEMO", "Watch the screens...");
+            
+            // Show arousal value on OLED, deprecated for alphanumeric display
+            // char arousal[32];
+            // sprintf(arousal, "Arousal: %d", simDelta);
+            alphanum_show_int(simDelta);
             matrix_graph_tick(
                 pressure - averagePressure,  // arousal delta
                 pressureLimit,               // scales bar height
