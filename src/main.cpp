@@ -532,7 +532,7 @@ void loop()
             // sprintf(arousal, "Arousal: %d", simDelta);
             alphanum_demo_tick();
             // Feed simulated arousal data to the matrix graph
-            matrix_graph_tick(sim_arousal, MAX_PRESSURE_LIMIT, ledMatrix);
+            matrix_graph_tick(sim_arousal, sim_pressure_limit, ledMatrix);
             
             // Advance the simulation by one tick
             sim_tick();

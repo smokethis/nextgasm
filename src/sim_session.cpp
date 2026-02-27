@@ -156,6 +156,17 @@ constexpr int BPM_ELEVATED           = 97;
 constexpr float MOTOR_RAMP_RATE      = 0.18;  // Slower than arousal ramp
 constexpr float MOTOR_BACKOFF_RATE   = 0.6;   // Fast drop when ceiling falls
 
+// Simulated sensitivity — a realistic mid-range knob position.
+// 200–300 is typical for a real session. This controls both when 
+// edges fire AND how the display scales, just like the real device.
+//
+// Lower = more sensitive = faster edges = more frequent cycling.
+// Higher = less sensitive = slower build = longer ramps.
+constexpr int SIM_PRESSURE_LIMIT = 250;
+
+// Public
+int sim_pressure_limit = SIM_PRESSURE_LIMIT;
+
 // ── Public GSR state ───────────────────────────────────────────────
 float sim_gsr         = 0.0;
 float sim_gsr_phasic  = 0.0;
@@ -271,12 +282,12 @@ void sim_tick()
     // it, rather than being generated directly. All the natural lag 
     // and overshoot behaviour comes free from the RA maths.
     int delta = sim_pressure - sim_avg_pressure;
-    sim_arousal = constrain(delta, 0, (int)MAX_PRESSURE_LIMIT);
+    sim_arousal = constrain(delta, 0, (int)sim_pressure_limit);
 
-    // For the motor ramp and edge detection, we need an "arousal 
-    // fraction" — how close are we to the edge threshold?
-    // Using pressureLimit here mirrors the real edge detection logic.
-    float arousalFraction = constrain((float)delta / (float)MAX_PRESSURE_LIMIT, 0.0f, 1.0f);
+    // Arousal fraction now scales against the sim's sensitivity, 
+    // not the global maximum. This means 0.0 = no delta, 1.0 = at 
+    // the edge threshold — same meaning as the real device.
+    float arousalFraction = constrain((float)delta / (float)sim_pressure_limit, 0.0f, 1.0f);
 
     if (cooldownTicks > 0)
     {
@@ -335,15 +346,14 @@ void sim_tick()
     }
 
     // ── EDGE DETECTION ─────────────────────────────────────────
-    // The real system triggers when (pressure - averagePressure) 
-    // exceeds pressureLimit. We do the same.
-    if (delta >= (int)MAX_PRESSURE_LIMIT)
+    // Edge detection — same logic as the real AUTO mode:
+    //   if (pressure - averagePressure > pressureLimit)
+    if (delta >= sim_pressure_limit)
     {
         cooldownTicks = random(COOLDOWN_MIN_TICKS, COOLDOWN_MAX_TICKS + 1);
         motorFloat = 0;
         edgeJustFired = true;
     }
-
     // ── 2. HEART RATE ──────────────────────────────────────────────
     //
     // Linear mapping: more aroused → faster heartbeat.

@@ -37,10 +37,19 @@
 // These are updated every time sim_tick() is called. Read them freely 
 // from any display module — they're stable between ticks.
 
-extern int   sim_arousal;       // Pressure delta (0 to ~MAX_PRESSURE_LIMIT)
+extern int   sim_arousal;       // Pressure delta (0 - pressure limit)
 extern int   sim_bpm;           // Heart rate in beats per minute (55–100)
 extern bool  sim_beat;          // True for exactly one tick when a "beat" occurs
 extern float sim_motor_speed;   // Simulated motor output (0–255), tracks arousal cycle
+
+// The simulated sensitivity threshold — equivalent to where the 
+// user would set the knob in a real session. Used for both edge 
+// detection and display scaling.
+//
+// In the real device: pressureLimit = map(knob, ..., 600, 1)
+// Here we pick a fixed mid-range value that produces natural-looking 
+// edge timing with our simulated contraction dynamics.
+extern int sim_pressure_limit;
 
 // GSR output: normalised 0.0–1.0, combining tonic baseline and 
 // phasic (event-triggered) components. Unlike arousal, GSR has 

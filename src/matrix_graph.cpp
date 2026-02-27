@@ -102,25 +102,27 @@ static uint8_t delta_to_height(int delta, int maxDelta)
     if (delta <= 0 || maxDelta <= 0) return 0;
 
     float normalised = (float)delta / (float)maxDelta;
-    if (normalised > 1.0) normalised = 1.0;
+    if (normalised > 1.0f) normalised = 1.0f;
 
-    // Square curve — opposite of sqrt. Low values stay squashed,
-    // high values expand rapidly. The graph looks calm during 
-    // the ramp then gets increasingly frantic near the peak.
+    // Square root curve — expands low values, compresses highs.
+    // The display fills gradually as arousal builds, rather than 
+    // being invisible for most of the ramp then exploding at the end.
     //
-    //   delta    linear    squared
-    //   ─────    ──────    ───────
-    //     0        0          0
-    //    75        1          0     ← low activity stays quiet
-    //   150        2          1
-    //   300        4          2
-    //   450        6          5     ← accelerates here
-    //   520        7          6
-    //   570        7          7
-    //   600        8          8
-    float curved = normalised * normalised;
+    // Comparison at pressureLimit = 250:
+    //
+    //   delta    squared    sqrt     linear
+    //   ─────    ───────    ────     ──────
+    //     50        0        3        2     ← sqrt shows early activity
+    //    100        1        5        3
+    //    150        3        6        5
+    //    200        5        7        6
+    //    250        8        8        8
+    //
+    // sqrtf() is a single hardware instruction on the Teensy 4.0's 
+    // FPU — essentially free. In Python: math.sqrt(normalised)
+    float curved = sqrtf(normalised);
 
-    int h = (int)(curved * ROWS + 0.5);
+    int h = (int)(curved * ROWS + 0.5f);
     if (h > ROWS) h = ROWS;
     return (uint8_t)h;
 }
@@ -218,34 +220,51 @@ void matrix_graph_init()
 {
     memset(history, 0, sizeof(history));
     lastShiftTime = millis();
+    // Can't reset the static from here directly, but we could 
+    // add a flag — or just let it settle naturally in ~400ms.
+    // For a clean reset, make smoothedDelta file-scope static instead.
 }
-
 
 void matrix_graph_tick(int arousalDelta, int maxDelta, HT1632C_Display& display)
 {
     unsigned long now = millis();
 
-    // ── Shift & sample at the configured interval ──────────────────
-    // memmove shifts the whole history array left by one slot, 
-    // dropping the oldest value (index 0) and freeing index 23 
-    // for the new sample. In Python this would be:
-    //   history.pop(0)
-    //   history.append(new_value)
+    // ── Smooth the input with an EMA ───────────────────────────────
+    // The raw delta is noisy tick-to-tick (muscle contractions are 
+    // jittery, plus the sim adds random noise). Since we only sample 
+    // into the history buffer every SHIFT_INTERVAL_MS (~90ms), the 
+    // unsmoothed value at sample time is essentially random — it 
+    // might catch a spike or a dip, giving a jagged display.
     //
-    // memmove (not memcpy) is used here because the source and 
-    // destination regions overlap — we're copying from index 1 into 
-    // index 0. memcpy is allowed to read and write simultaneously 
-    // (which corrupts overlapping regions), while memmove guarantees 
-    // correct handling of overlaps. It's a classic C/C++ gotcha.
+    // The EMA continuously tracks the delta across ALL ticks, so 
+    // when we do sample, we get the recent trend rather than an 
+    // arbitrary instant. Same technique as the BPM smoothing on 
+    // the alphanumeric display.
+    //
+    // Alpha of 0.08 at 60Hz ≈ 2/(24+1) ≈ 24-sample window ≈ 400ms.
+    // That's long enough to iron out tick-to-tick jitter but short 
+    // enough to track genuine changes in the delta over seconds.
+    //
+    // The alpha value (0.08) is the main tuning knob. If the display still looks a bit twitchy, drop it to 0.05 for a ~600ms window. If it feels too sluggish and doesn't react quickly enough to rising arousal, push it up to 0.12. The sweet spot is where you can see the bars building smoothly during a ramp but still see the drop after an edge within a second or two.
+    //
+    // 'static' so it persists between calls, like a class attribute.
+    static float smoothedDelta = 0.0f;
+    constexpr float GRAPH_ALPHA = 0.08f;
+
+    // Clamp negative deltas to zero before smoothing — we don't 
+    // want post-edge negative deltas dragging the average down 
+    // and creating a sluggish recovery on the display.
+    float clampedDelta = (arousalDelta > 0) ? (float)arousalDelta : 0.0f;
+    smoothedDelta = GRAPH_ALPHA * clampedDelta + (1.0f - GRAPH_ALPHA) * smoothedDelta;
+
+    // ── Shift & sample at the configured interval ──────────────────
     if (now - lastShiftTime >= SHIFT_INTERVAL_MS)
     {
         lastShiftTime = now;
-
-        // Shift everything one column to the left
         memmove(&history[0], &history[1], COLS - 1);
 
-        // Sample current arousal into the newest column (rightmost)
-        history[COLS - 1] = delta_to_height(arousalDelta, maxDelta);
+        // Sample the SMOOTHED value, not the raw one
+        history[COLS - 1] = delta_to_height((int)(smoothedDelta + 0.5f), maxDelta);
     }
 
     // ── Render all columns ─────────────────────────────────────────
