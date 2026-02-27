@@ -21,10 +21,13 @@ Last updated: 2026-02-26
 |-----------|----------|-----------|-------------|--------|
 | 2 | Encoder A | Rotary encoder | | Quadrature input |
 | 3 | Encoder B | Rotary encoder | | Quadrature input |
+| 4  | CS  | ST7789V2 colour LCD | | SPI chip select, active low |
 | 5 | Encoder button | Rotary encoder | | INPUT, internal pull-up |
 | 6 | CS | HT1632C LED matrix | | OUTPUT, active low |
 | 7 | WR | HT1632C LED matrix | | OUTPUT |
 | 8 | DATA | HT1632C LED matrix | | OUTPUT |
+| 11 | MOSI | ST7789V2 colour LCD (SPI0) | | Hardware SPI — fixed |
+| 13 | SCK  | ST7789V2 colour LCD (SPI0) | | Hardware SPI — fixed (also onboard LED) |
 | 15 | Up | 5-way nav switch | | INPUT_PULLUP |
 | 16 | Down | 5-way nav switch | | INPUT_PULLUP |
 | 17 | Left | 5-way nav switch | | INPUT_PULLUP |
@@ -32,6 +35,8 @@ Last updated: 2026-02-26
 | 19 | SCL | OLED display (I2C) | | Hardware I2C — fixed, not configurable |
 | 20 | Right | 5-way nav switch | | INPUT_PULLUP |
 | 21 | Center/Press | 5-way nav switch | | INPUT_PULLUP |
+| 22 | DC   | ST7789V2 colour LCD | | Data/Command select |
+| 23 | RST  | ST7789V2 colour LCD | | Hardware reset, active low |
 
 ### Reserved (not yet wired)
 
@@ -46,12 +51,7 @@ Last updated: 2026-02-26
 | Teensy Pin | Notes |
 |-----------|-------|
 | 0, 1 | Serial1 RX/TX — keep free if you ever want a second serial port |
-| 4 | General purpose |
-| 11 | SPI MOSI — useful if adding SPI devices (e.g. colour LCD) |
 | 12 | SPI MISO |
-| 13 | SPI SCK (also onboard LED) |
-| 22 | General purpose |
-| 23 | General purpose |
 | A1–A9 (15–23) | Some overlap with nav switch pins above; remaining analog-capable pins are available |
 
 ## Component Wiring Details
@@ -91,6 +91,21 @@ No external resistors needed — uses internal pull-ups.
 | CS | Teensy pin 6 |
 | WR | Teensy pin 7 |
 | DATA | Teensy pin 8 |
+
+### ST7789V2 Colour LCD (Waveshare 1.69" 240×280, SPI)
+
+| Display Pin | Connects To |
+|------------|-------------|
+| VCC | 3.3V rail |
+| GND | GND rail |
+| DIN | Teensy pin 11 (SPI0 MOSI) |
+| CLK | Teensy pin 13 (SPI0 SCK) |
+| CS  | Teensy pin 4 |
+| DC  | Teensy pin 22 |
+| RST | Teensy pin 23 |
+| BL  | 3.3V rail (always on) |
+
+SPI bus: SPI0 (shared bus — uses CS for device selection).
 
 ### Rotary Encoder
 
