@@ -52,6 +52,7 @@
 #include "nav_switch.h"
 #include "HT1632C_Display.h"
 #include "menu.h"
+#include "colour_lcd.h"
 
 // ============================================================
 // File-scope objects
@@ -121,6 +122,7 @@ void setup()
 
     display_init();
     ledMatrix.begin();
+    lcd_init();
 
     // Recall saved settings from EEPROM
     sensitivity = EEPROM.read(SENSITIVITY_ADDR);
@@ -194,6 +196,7 @@ void loop()
                     motor_write(0);
                 }
             }
+            lcd_test_tick();
             break;
         }
 
