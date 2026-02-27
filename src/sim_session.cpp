@@ -39,12 +39,77 @@
 
 #include "sim_session.h"
 #include "config.h"
+#include "RunningAverage.h"
+
+// ── Simulated pressure internals ───────────────────────────────────
+//
+// We model the pressure sensor signal as three layers:
+//
+//   raw_pressure = baseline + contraction + noise
+//
+// baseline:     Stable resting pressure from the plug (~512).
+//               Doesn't change during a session.
+//
+// contraction:  Involuntary muscle response to motor stimulation.
+//               Builds slowly while the motor runs, relaxes when 
+//               it stops. This is what creates the delta that 
+//               triggers edge detection.
+//
+// noise:        Random fluctuation proportional to contraction
+//               intensity. Relaxed muscles are quiet; activated 
+//               muscles are jittery. Simulates the real sensor's 
+//               tick-to-tick variance.
+
+static float contractionFloat  = 0.0f;  // Current contraction intensity
+static float contractionTarget = 0.0f;  // What contractions are building toward
+static int   simTickCount      = 0;     // For RA sub-sampling at 6Hz
+
+// Use the same RunningAverage library as the real pressure system,
+// with the same buffer size. This way any tuning changes to 
+// RA_HIST_SECONDS or RA_FREQUENCY in config.h automatically apply 
+// to the simulation too.
+//
+// In Python: self.ra = RunningAverage(RA_FREQUENCY * RA_HIST_SECONDS)
+static RunningAverage simRA(RA_FREQUENCY * RA_HIST_SECONDS);
 
 // ── Public state (defined here, declared extern in header) ─────────
 int   sim_arousal     = 0;
 int   sim_bpm         = 65;
 bool  sim_beat        = false;
 float sim_motor_speed = 0;
+int sim_pressure     = 0;
+int sim_avg_pressure = 0;
+
+// ── Pressure simulation constants ──────────────────────────────────
+
+// Resting pressure baseline — the "zero" that contractions build on.
+// Chosen to sit mid-range of the ADC, similar to a well-calibrated 
+// real device. The exact value doesn't matter much because the 
+// delta (pressure - average) is what drives everything.
+constexpr int   SIM_BASELINE        = 1024;
+
+// How quickly contractions chase their target (per tick).
+// 0.02 at 60Hz means it takes ~50 ticks (~0.8s) to reach 63% of 
+// the target. In Python: contraction += 0.02 * (target - current)
+// This models the physiological lag of muscle recruitment.
+constexpr float CONTRACTION_ALPHA   = 0.02f;
+
+// How much motor/arousal drives the contraction target.
+// At full motor (255) and full arousal fraction (1.0), the target 
+// contraction is ~1.0 × this value. Needs to be large enough that 
+// the resulting delta can reach pressureLimit (600) but not so 
+// large that it gets there too quickly.
+constexpr float CONTRACTION_GAIN    = 800.0f;
+
+// Noise scales with contraction intensity — relaxed muscles are 
+// quiet, activated muscles are jittery. This multiplier sets how 
+// much random variation there is relative to contraction level.
+constexpr float CONTRACTION_NOISE   = 0.15f;
+
+// Post-edge relaxation speed. Muscles don't instantly relax — 
+// they release over several seconds. This controls how fast the 
+// contraction target drops during cooldown.
+constexpr float RELAXATION_RATE     = 0.04f;
 
 // ── Internal simulation state ──────────────────────────────────────
 // 'static' = file-private. These persist between tick() calls but 
@@ -156,6 +221,12 @@ void sim_reset()
     // In Python: random.seed(int.from_bytes(os.urandom(2), 'big'))
     randomSeed(analogRead(A9));
 
+    simRA.clear();
+    contractionFloat  = 0.0f;
+    contractionTarget = 0.0f;
+    sim_pressure      = SIM_BASELINE;
+    sim_avg_pressure  = SIM_BASELINE;
+    simTickCount      = 0;
     arousalFloat       = 0.0;
     motorFloat         = 0.0;
     sim_arousal        = 0;
@@ -179,54 +250,99 @@ void sim_reset()
 
 void sim_tick()
 {
-    // ── 1. AROUSAL RAMP ────────────────────────────────────────────
+    // ── 1. PRESSURE SIMULATION ─────────────────────────────────────
     //
-    // During cooldown, arousal stays near the floor (with tiny drift).
-    // Otherwise, it ramps up with noise until hitting the threshold.
+    // Instead of ramping an abstract "arousal" value, we simulate 
+    // what the pressure sensor actually sees.
+    //
+    // The causal chain mirrors reality:
+    //   motor runs → vibration causes involuntary contractions →
+    //   contractions raise pressure → RA can't keep up →
+    //   delta (pressure - average) grows → delta hits limit → edge!
+    //
+    // This produces naturally realistic delta curves because the 
+    // running average's lag, catch-up, and post-edge overshoot all 
+    // emerge from the same maths the real device uses.
+
+    simTickCount++;
+
+    // ── DERIVE DELTA (the emergent "arousal" value) ────────────────
+    // This is now computed exactly the way the real display code does 
+    // it, rather than being generated directly. All the natural lag 
+    // and overshoot behaviour comes free from the RA maths.
+    int delta = sim_pressure - sim_avg_pressure;
+    sim_arousal = constrain(delta, 0, (int)MAX_PRESSURE_LIMIT);
+
+    // For the motor ramp and edge detection, we need an "arousal 
+    // fraction" — how close are we to the edge threshold?
+    // Using pressureLimit here mirrors the real edge detection logic.
+    float arousalFraction = constrain((float)delta / (float)MAX_PRESSURE_LIMIT, 0.0f, 1.0f);
 
     if (cooldownTicks > 0)
     {
-        // Post-edge cooldown: arousal drifts slowly near the floor.
-        // The tiny random walk keeps the display alive rather than 
-        // showing a static number.
+        // Post-edge: muscles gradually relax, contraction target 
+        // decays toward zero. Not instant — like a slowly unclenching fist.
         cooldownTicks--;
-        arousalFloat += (random(-10, 11) / 100.0);  // ±0.1 drift
-        arousalFloat = max(arousalFloat, 0.0f);
-
-        // Motor stays off during cooldown
+        contractionTarget *= (1.0f - RELAXATION_RATE);
         motorFloat -= MOTOR_BACKOFF_RATE;
         if (motorFloat < 0) motorFloat = 0;
     }
     else
     {
-        // Active ramping phase
-        float noise = (random(-100, 101) / 100.0) * AROUSAL_NOISE_RANGE;
-        arousalFloat += AROUSAL_RAMP_BASE + noise;
+        // Motor ramps linearly on its own, just like the real device.
+        // motorIncrement in the real code is:
+        //   maxMotorSpeed / (rampUp * FREQUENCY)
+        // e.g. 255 / (10 * 60) = 0.425 per tick → full speed in 10 seconds.
+        //
+        // The motor doesn't "know" about pressure at all — it just 
+        // climbs. Pressure is what STOPS it (via edge detection).
+        motorFloat += MOTOR_RAMP_RATE;
+        if (motorFloat > MOT_MAX) motorFloat = MOT_MAX;
 
-        // Motor ramps up toward a ceiling proportional to arousal
-        float motorCeiling = (arousalFloat / edgeThreshold) * MOT_MAX;
-        motorCeiling = constrain(motorCeiling, 0, (float)MOT_MAX);
+        // NOW contractions can follow from the motor being active
+        float motorFraction = motorFloat / (float)MOT_MAX;
+        contractionTarget = motorFraction * CONTRACTION_GAIN;
 
-        if (motorFloat < motorCeiling)
-            motorFloat += MOTOR_RAMP_RATE;
-        else if (motorFloat > motorCeiling)
-            motorFloat -= MOTOR_BACKOFF_RATE;
-
-        // ── EDGE DETECTION ─────────────────────────────────────────
-        if (arousalFloat >= edgeThreshold)
+        // Edge detection using the emergent delta
+        if (delta >= (int)MAX_PRESSURE_LIMIT)
         {
-            // Edge hit! Sharp drop, enter cooldown.
-            arousalFloat = edgeThreshold * POST_EDGE_FLOOR;
-            motorFloat   = 0;
             cooldownTicks = random(COOLDOWN_MIN_TICKS, COOLDOWN_MAX_TICKS + 1);
+            motorFloat = 0;
             edgeJustFired = true;
-            pick_new_threshold();  // Next cycle edges at a different level
         }
     }
 
-    // Clamp and publish the integer version
-    sim_arousal     = constrain((int)arousalFloat, 0, MAX_PRESSURE_LIMIT);
-    sim_motor_speed = constrain(motorFloat, 0, (float)MOT_MAX);
+    // Contraction intensity chases the target with physiological lag.
+    // In Python: contraction += alpha * (target - contraction)
+    contractionFloat += CONTRACTION_ALPHA * (contractionTarget - contractionFloat);
+
+    // Noise proportional to contraction intensity.
+    // Quiet when relaxed, jittery when clenching. The ±range scales 
+    // with current contraction level, so noise is multiplicative.
+    float pNoise = (random(-100, 101) / 100.0f) * contractionFloat * CONTRACTION_NOISE;
+
+    // Assemble the raw pressure reading
+    float rawPressure = SIM_BASELINE + contractionFloat + pNoise;
+    sim_pressure = constrain((int)rawPressure, 0, ADC_MAX);
+
+    // Feed into running average at the same sub-frequency as the 
+    // real system (6Hz = every RA_TICK_PERIOD ticks).
+    // This is identical to how update_pressure() works in pressure.cpp.
+    if (simTickCount % RA_TICK_PERIOD == 0)
+    {
+        simRA.addValue(sim_pressure);
+        sim_avg_pressure = (int)simRA.getAverage();
+    }
+
+    // ── EDGE DETECTION ─────────────────────────────────────────
+    // The real system triggers when (pressure - averagePressure) 
+    // exceeds pressureLimit. We do the same.
+    if (delta >= (int)MAX_PRESSURE_LIMIT)
+    {
+        cooldownTicks = random(COOLDOWN_MIN_TICKS, COOLDOWN_MAX_TICKS + 1);
+        motorFloat = 0;
+        edgeJustFired = true;
+    }
 
     // ── 2. HEART RATE ──────────────────────────────────────────────
     //
@@ -237,7 +353,6 @@ void sim_tick()
     //   base = lerp(BPM_RESTING, BPM_ELEVATED, arousal / threshold)
     //   bpm = base + random.randint(-1, 1)
 
-    float arousalFraction = constrain(arousalFloat / THRESHOLD_MAX, 0.0f, 1.0f);
     int baseBpm = BPM_RESTING + (int)(arousalFraction * (BPM_ELEVATED - BPM_RESTING));
     sim_bpm = constrain(baseBpm + random(-1, 2), BPM_RESTING - 3, BPM_ELEVATED + 3);
 

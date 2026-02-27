@@ -57,6 +57,26 @@ extern float sim_gsr_phasic;    // Just the spike component (for displays
                                 // that want to show "event reactivity"
                                 // separately from baseline)
 
+// ── Simulated pressure system ──────────────────────────────────────────
+// Instead of directly generating a "delta" value, we simulate what
+// the pressure sensor actually reads, then derive the delta through
+// the same RunningAverage logic the real device uses.
+//
+// This means sim_arousal (the delta) naturally exhibits all the 
+// real system's behaviours:
+//   - Running average lag (delta builds as RA can't keep up)
+//   - Post-edge negative delta (RA still elevated after relaxation)
+//   - Gradual RA catch-up during sustained contractions
+//
+// In Python terms, we used to generate:      delta = sawtooth()
+// Now we generate:  pressure = baseline + contractions + noise
+//                   average  = running_average(pressure)
+//                   delta    = pressure - average         ← emergent!
+
+extern int   sim_pressure;        // Raw simulated pressure (≈ADC reading)
+extern int   sim_avg_pressure;    // Running average of sim_pressure
+// sim_arousal is now derived:    sim_pressure - sim_avg_pressure
+
 // ── Control ────────────────────────────────────────────────────────────
 
 // Reset all simulation state. Call when entering demo mode so each 
