@@ -28,11 +28,29 @@
 // Most I2C SH1106 boards tie reset high internally.
 static U8G2_SH1106_128X64_NONAME_F_HW_I2C oleddisplay(U8G2_R0, U8X8_PIN_NONE);
 
-// Display updates are slow (~10-30ms for a full I2C transfer at 
-// 400kHz). We don't want to block the 60Hz control loop, so we 
-// throttle display refreshes to a sensible rate.
+// ── Shared display throttle ────────────────────────────────────────────
+// All three display functions (display_update, display_menu, 
+// display_message) share this throttle. Since only ONE of them runs 
+// at any given time (the main loop picks based on AppState), they 
+// won't interfere with each other.
+//
+// Without throttling, a 60Hz main loop would hammer the I2C bus with 
+// display updates. Each full-frame I2C transfer takes ~10-30ms at 
+// 400kHz, which would eat into our 16ms tick budget. Throttling to 
+// 10Hz keeps updates snappy without starving other I/O.
 constexpr unsigned long DISPLAY_UPDATE_INTERVAL_MS = 100;  // 10Hz
 static unsigned long lastDisplayUpdate = 0;
+
+// Returns true if enough time has passed for a display refresh.
+// Updates the timestamp internally so callers can just do:
+//   if (!display_throttle_check()) return;
+static bool display_throttle_check()
+{
+    unsigned long now = millis();
+    if (now - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL_MS) return false;
+    lastDisplayUpdate = now;
+    return true;
+}
 
 // Convert the numeric mode constant to a human-readable string.
 static const char* mode_to_string(uint8_t mode)
@@ -50,6 +68,10 @@ static const char* mode_to_string(uint8_t mode)
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Initialisation
+// ════════════════════════════════════════════════════════════════════════
+
 void display_init()
 {
     oleddisplay.begin();
@@ -59,12 +81,13 @@ void display_init()
     oleddisplay.sendBuffer();
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Operational Display (used in APP_RUNNING)
+// ════════════════════════════════════════════════════════════════════════
+
 void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePressure, NavDirection navDir)
 {
-    // Throttle updates so we don't bog down the main loop.
-    unsigned long now = millis();
-    if (now - lastDisplayUpdate < DISPLAY_UPDATE_INTERVAL_MS) return;
-    lastDisplayUpdate = now;
+    if (!display_throttle_check()) return;
 
     // --- Build the frame ---
     oleddisplay.clearBuffer();
@@ -74,14 +97,8 @@ void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePre
     oleddisplay.drawStr(0, 12, mode_to_string(mode));
 
     // Nav direction indicator — top right corner
-    // Shows which direction on the 5-way switch is currently pressed.
-    // This gives immediate visual feedback for testing the switch.
     if (navDir != NAV_NONE) {
-        // Draw direction name right-aligned in the header area
         const char* dirName = nav_direction_name(navDir);
-        // getStrWidth() returns pixel width of a string in the current font.
-        // We use it to right-align: start position = screen width - text width.
-        // In Python terms: x = 128 - len(text) * char_width
         int textWidth = oleddisplay.getStrWidth(dirName);
         oleddisplay.drawStr(128 - textWidth, 12, dirName);
     }
@@ -94,16 +111,15 @@ void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePre
 
     // Motor speed as a percentage (0-100%) and a bar graph
     int speedPct = (int)(motorSpeed / MOT_MAX * 100);
-    
     char buf[22];
 
     snprintf(buf, sizeof(buf), "Motor: %3d%%", speedPct);
     oleddisplay.drawStr(0, 30, buf);
 
-    // Visual bar for motor speed — 60px wide max, next to the text
+    // Visual bar for motor speed — 50px wide, next to the text
     int barWidth = map(speedPct, 0, 100, 0, 50);
     oleddisplay.drawFrame(74, 22, 52, 10);    // Outline
-    oleddisplay.drawBox(75, 23, barWidth, 8); // Filled portion
+    oleddisplay.drawBox(75, 23, barWidth, 8);  // Filled portion
 
     // Pressure delta (what the edging algorithm actually uses)
     int delta = pressure - averagePressure;
@@ -115,5 +131,141 @@ void display_update(uint8_t mode, float motorSpeed, int pressure, int averagePre
     oleddisplay.drawStr(0, 58, buf);
 
     // --- Send to hardware ---
+    oleddisplay.sendBuffer();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Menu Display (used in APP_MENU)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Layout for a 128x64 OLED with 3 menu items:
+//
+//   ┌────────────────────────────┐
+//   │     N E X T G A S M        │  ← title, bold font, centred
+//   │────────────────────────────│  ← divider line at y=18
+//   │                            │
+//   │    ▸ Start                 │  ← selected item (▸ = filled triangle)
+//   │      Settings              │
+//   │      Demo                  │
+//   │                            │
+//   └────────────────────────────┘
+//
+// The cursor is a small filled triangle (▸) drawn to the left of the 
+// highlighted item. It's more visually distinct than a ">" character 
+// and doesn't depend on the font having that glyph at the right size.
+//
+// Vertical spacing is calculated to centre the item list in the 
+// remaining space below the divider. With 3 items at 14px line height, 
+// that's 42px of content in 44px of space — nicely balanced.
+
+void display_menu(const char* title, const char* items[], uint8_t itemCount, uint8_t cursorPos)
+{
+    if (!display_throttle_check()) return;
+
+    oleddisplay.clearBuffer();
+
+    // ── Title ──────────────────────────────────────────────────────────
+    oleddisplay.setFont(u8g2_font_7x14B_tr);
+    int titleWidth = oleddisplay.getStrWidth(title);
+    int titleX = (128 - titleWidth) / 2;  // Centre horizontally
+    oleddisplay.drawStr(titleX, 13, title);
+
+    // Divider
+    oleddisplay.drawHLine(0, 18, 128);
+
+    // ── Menu items ─────────────────────────────────────────────────────
+    // Each item gets 14px of vertical space (matches the bold font height).
+    // We start at y=32 which gives a comfortable gap below the divider.
+    //
+    // Y coordinates in U8g2 refer to the font BASELINE (bottom of 
+    // letters, not top). So y=32 means the bottom of the first line 
+    // of text sits at pixel row 32. This is like CSS with 
+    // vertical-align: baseline, not top.
+    
+    oleddisplay.setFont(u8g2_font_7x14_tr);  // Regular weight for items
+
+    constexpr uint8_t ITEM_START_Y = 34;   // Baseline of first item
+    constexpr uint8_t ITEM_SPACING = 15;   // Pixels between baselines
+    constexpr uint8_t TEXT_LEFT = 20;       // Left margin for item text
+    constexpr uint8_t CURSOR_LEFT = 8;     // Left margin for cursor triangle
+
+    for (uint8_t i = 0; i < itemCount; i++) {
+        uint8_t y = ITEM_START_Y + (i * ITEM_SPACING);
+
+        // Draw the item label
+        oleddisplay.drawStr(TEXT_LEFT, y, items[i]);
+
+        // Draw cursor triangle next to the highlighted item.
+        // Using drawTriangle() to make a small filled right-pointing 
+        // arrow: ▸. Three vertices form a rightward-pointing triangle.
+        //
+        // The triangle is 5px wide and 7px tall, vertically centred 
+        // on the text line. Since y is the baseline and the font is 
+        // ~10px tall with ascenders, we offset upward by 8px for the 
+        // top vertex and 1px for the bottom.
+        if (i == cursorPos) {
+            // Filled triangle: (x0,y0), (x1,y1), (x2,y2)
+            //   Top vertex:    (CURSOR_LEFT, y - 9)
+            //   Bottom vertex: (CURSOR_LEFT, y - 2)
+            //   Point vertex:  (CURSOR_LEFT + 5, y - 5)  ← the rightward tip
+            oleddisplay.drawTriangle(
+                CURSOR_LEFT,     y - 9,   // Top-left
+                CURSOR_LEFT,     y - 2,   // Bottom-left
+                CURSOR_LEFT + 5, y - 5    // Right point (tip of arrow)
+            );
+        }
+    }
+
+    // ── Navigation hint at bottom ──────────────────────────────────────
+    // Subtle reminder of controls. Small font, grey-ish (on a mono 
+    // display "grey" just means we draw it — could be dimmed with 
+    // setDrawColor in some modes, but keeping it simple for now).
+    // Navigation hint — using a font that includes arrow glyphs.
+    // The "_tf" suffix means "transparent, full range" (chars 0-255)
+    // vs "_tr" which only covers printable ASCII (32-127).
+    // 0x18 = ↑ and 0x19 = ↓ in the CP437 character set that U8g2 uses.
+    oleddisplay.setFont(u8g2_font_5x7_tf);
+    oleddisplay.drawStr(28, 63, "\x18\x19 Navigate  OK Select");
+
+    oleddisplay.sendBuffer();
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Message Display (used for placeholder screens)
+// ════════════════════════════════════════════════════════════════════════
+//
+// Simple two-line centred display for screens that don't have full 
+// UI yet (Settings, Demo). Shows a title and a message, plus a hint 
+// about how to get back to the menu.
+//
+// Layout:
+//   ┌────────────────────────────┐
+//   │                            │
+//   │        SETTINGS            │  ← title, bold, centred
+//   │      Coming soon...        │  ← message, regular, centred
+//   │                            │
+//   │          \x18 Back              │  ← nav hint
+//   └────────────────────────────┘
+
+void display_message(const char* title, const char* message)
+{
+    if (!display_throttle_check()) return;
+
+    oleddisplay.clearBuffer();
+
+    // Title — bold, centred vertically and horizontally
+    oleddisplay.setFont(u8g2_font_7x14B_tr);
+    int titleWidth = oleddisplay.getStrWidth(title);
+    oleddisplay.drawStr((128 - titleWidth) / 2, 28, title);
+
+    // Message — regular weight, centred below title
+    oleddisplay.setFont(u8g2_font_6x10_tr);
+    int msgWidth = oleddisplay.getStrWidth(message);
+    oleddisplay.drawStr((128 - msgWidth) / 2, 44, message);
+
+    // Navigation hint
+    oleddisplay.setFont(u8g2_font_5x7_tf);
+    oleddisplay.drawStr(44, 63, "\x18 Back to menu");
+
     oleddisplay.sendBuffer();
 }

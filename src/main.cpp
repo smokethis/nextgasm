@@ -1,10 +1,38 @@
 // main.cpp — Main entry point for the Nextgasm project
 // Based on code from protogasm: https://github.com/night-howler/protogasm
 //
-// This file now only handles:
+// This file handles:
 //   1. Defining global variables (the "real" copies that extern points to)
 //   2. setup() — one-time hardware initialization
 //   3. loop() — the 60Hz main tick that orchestrates everything
+//
+// The loop now has TWO layers of state:
+//
+//   AppState (menu.h)  — which "screen" are we on?
+//     APP_MENU     → main menu, nav up/down/center to pick
+//     APP_RUNNING  → device is operational, existing mode cycling
+//     APP_SETTINGS → settings screen (placeholder)
+//     APP_DEMO     → demo/attract mode (placeholder)
+//
+//   operationalState (config.h)  — within APP_RUNNING, which mode?
+//     STANDBY, MANUAL, AUTO, OPT_SPEED, etc.
+//
+// NAV_UP always means "go back up one level":
+//   - In APP_RUNNING/SETTINGS/DEMO → return to APP_MENU
+//   - In APP_MENU → moves cursor up (handled by menu module)
+//
+// In Python terms, the structure is like:
+//
+//   while True:
+//       if app_state == "menu":
+//           app_state = menu.handle_input(nav)
+//       elif app_state == "running":
+//           if nav == UP:
+//               app_state = "menu"
+//           else:
+//               operational_state_machine.tick(nav)
+//       elif app_state == "settings":
+//           ...
 
 #include <Arduino.h>
 #include <Encoder.h>
@@ -23,24 +51,14 @@
 #include "oleddisplay.h"
 #include "nav_switch.h"
 #include "HT1632C_Display.h"
+#include "menu.h"
 
 // ============================================================
 // File-scope objects
 // ============================================================
-// The LED matrix lives here at file scope so it persists for the 
-// lifetime of the program. Previously it was declared inside setup(),
-// which meant C++ destroyed it when setup() returned — like a local 
-// variable going out of scope in a Python function. The object still 
-// existed in memory (embedded systems don't reclaim stack frames the 
-// same way), but it was technically "dead" and any future use would 
-// be undefined behaviour.
 HT1632C_Display ledMatrix;
 
-// Convert mode constant to a display string.
-// There's an identical copy in oleddisplay.cpp (as a static function).
-// We could factor this into a shared header, but for a tiny switch 
-// statement the duplication is harmless and avoids creating a new 
-// module just for one helper.
+// Convert operational mode constant to a display string for the LED matrix.
 static const char* mode_to_string(uint8_t mode)
 {
     switch (mode) {
@@ -88,9 +106,9 @@ void setup()
     motor_init();
     pressure_init();
     nav_init();
+    menu_init();
 
     pinMode(BUTTPIN, INPUT);
-
     analogReadResolution(12);
 
     delay(3000);  // Recovery delay for FastLED
@@ -102,9 +120,6 @@ void setup()
     FastLED.setBrightness(BRIGHTNESS);
 
     display_init();
-
-    // Initialize the LED matrix — now using the file-scope instance
-    // instead of a local that would vanish after setup().
     ledMatrix.begin();
 
     // Recall saved settings from EEPROM
@@ -119,91 +134,184 @@ void setup()
 // ============================================================
 void loop()
 {
-    static uint8_t state = STANDBY;
+    // ── Top-level app state ────────────────────────────────────────────
+    // This is the "which screen" variable. It starts at APP_MENU so 
+    // the device boots into the main menu rather than immediately 
+    // entering operational mode.
+    static AppState appState = APP_MENU;
+
+    // ── Operational state (only matters when appState == APP_RUNNING) ──
+    static uint8_t operationalState = STANDBY;
+
+    // ── Shared loop state ──────────────────────────────────────────────
     static int sampleTick = 0;
     static unsigned long lastTick = 0;
-    static uint8_t nextState;
-    static NavDirection lastNavDir;
+    static NavDirection lastNavDir = NAV_NONE;
 
-    // Track previous state so we only redraw the matrix when 
-    // the mode actually changes. The HT1632C bit-bang write is 
-    // fast (~50µs for 48 bytes at Teensy 4.0 speeds), but 
-    // there's no point redrawing identical content 60 times 
-    // per second. This is the same idea as React's "only 
-    // re-render when state changes" philosophy.
+    // ── 60Hz tick gate ─────────────────────────────────────────────────
+    if (millis() - lastTick < UPDATE_PERIOD_MS) return;
+    lastTick = millis();
+    sampleTick++;
 
-    if (millis() - lastTick >= UPDATE_PERIOD_MS) {
-        lastTick = millis();
-        sampleTick++;
+    // Read the nav switch (debounced by the nav module)
+    NavDirection navDir = nav_read();
 
-        // Update pressure reading and running average
-        update_pressure(sampleTick);
+    // Edge detection: did the direction just change this tick?
+    // This prevents held directions from firing repeatedly.
+    // In Python terms: navChanged = (navDir != lastNavDir)
+    bool navChanged = (navDir != lastNavDir);
 
-        // Read 5-way nav switch (debounced)
-        NavDirection navDir = nav_read();
+    // ── Dispatch based on app state ────────────────────────────────────
+    // Each case is like a separate "screen" or "scene" with its own 
+    // input handling, display updates, and peripheral control.
 
-        // Fade LED buffer (creates trailing light effect)
-        fadeToBlackBy(leds, NUM_LEDS, 20);
+    switch (appState)
+    {
+        // ────────────────────────────────────────────────────────────────
+        // MAIN MENU
+        // ────────────────────────────────────────────────────────────────
+        // The menu module handles its own cursor movement and selection.
+        // We just pass it the nav input and check if it wants to 
+        // transition to a different app state.
+        case APP_MENU:
+        {
+            AppState nextAppState = menu_update(navDir);
+            menu_render();
+            ledMatrix.scrollText("NEXTGASM");
 
-        // DEPRECATE USE OF ENCODER BUTTON - Handle button input and state transitions
-        // uint8_t btnState = check_button();
-        // state = set_state(btnState, state);
+            // If the menu told us to go somewhere, set up for it
+            if (nextAppState != APP_MENU)
+            {
+                appState = nextAppState;
 
-        // Run state machine 
-        run_state_machine(state);
-
-        // Check if direction has been pressed and take action if so. 
-        // Be sure to only activate once when changing modes.
-        switch (navDir) {
-            case NAV_LEFT:
-                if (lastNavDir != NAV_LEFT) {
-                    nextState = get_previous_state(state);
-                    run_state_machine(nextState);
-                    state = nextState;
-                    lastNavDir = navDir;
+                // When entering operational mode, start in STANDBY 
+                // with the motor off — the user then uses left/right 
+                // to navigate to the mode they want.
+                if (appState == APP_RUNNING)
+                {
+                    operationalState = STANDBY;
+                    motorSpeed = 0;
+                    motor_write(0);
                 }
-                break;
-            case NAV_RIGHT:
-                if (lastNavDir != NAV_RIGHT) {
-                    nextState = get_next_state(state);
-                    run_state_machine(nextState);
-                    state = nextState;
-                    lastNavDir = navDir;
-                }
-                break;
-            case NAV_UP:
-                if (lastNavDir != NAV_UP) {
-                    lastNavDir = navDir;
-                }
-                break;
-            case NAV_DOWN:
-                if (lastNavDir != NAV_DOWN) {
-                    lastNavDir = navDir;
-                }
-                break;
-            case NAV_CENTER: 
-                state = STANDBY;
-                run_state_machine(state);
-                lastNavDir = navDir;
-                break;
-            case NAV_NONE:
-                lastNavDir = navDir;
-                break;
+            }
+            break;
         }
 
-        // Push LED buffer to hardware
-        FastLED.show();
+        // ────────────────────────────────────────────────────────────────
+        // OPERATIONAL MODE (the existing state machine)
+        // ────────────────────────────────────────────────────────────────
+        // This is where all the original protogasm functionality lives.
+        // NAV_LEFT/RIGHT cycles through modes, NAV_CENTER → STANDBY,
+        // and NAV_UP is our escape hatch back to the menu.
+        case APP_RUNNING:
+        {
+            // ── NAV_UP: return to main menu ────────────────────────────
+            // Safety first — stop the motor before leaving operational 
+            // mode. We don't want the vibrator running unattended while 
+            // the user is browsing the menu.
+            if (navDir == NAV_UP && navChanged)
+            {
+                motorSpeed = 0;
+                motor_write(0);
+                menu_reset_cursor();
+                appState = APP_MENU;
+                break;  // Skip the rest of this tick
+            }
 
-        // Update LED matrix when mode changes
-        ledMatrix.scrollText(mode_to_string(state));
-        
-        // Run OLED display update routine (now includes nav direction)
-        display_update(state, motorSpeed, pressure, averagePressure, navDir);
+            // ── Pressure sensing ───────────────────────────────────────
+            update_pressure(sampleTick);
 
-        // Warn if pressure sensor is railing (trimpot needs adjustment)
-        if (pressure > 4030) beep_motor(2093, 2093, 2093);
+            // ── LED fade (creates trailing light effect) ───────────────
+            fadeToBlackBy(leds, NUM_LEDS, 20);
 
-        // Report data over USB
-        report_serial();
+            // ── Run current operational mode ───────────────────────────
+            run_state_machine(operationalState);
+
+            // ── Handle nav for mode cycling ────────────────────────────
+            // This is the same logic that was in the old main.cpp, just 
+            // using the shared navChanged flag instead of comparing to 
+            // a separate lastNavDir.
+            if (navChanged)
+            {
+                uint8_t nextState;
+                switch (navDir) {
+                    case NAV_LEFT:
+                        nextState = get_previous_state(operationalState);
+                        operationalState = nextState;
+                        run_state_machine(operationalState);
+                        break;
+
+                    case NAV_RIGHT:
+                        nextState = get_next_state(operationalState);
+                        operationalState = nextState;
+                        run_state_machine(operationalState);
+                        break;
+
+                    case NAV_CENTER:
+                        operationalState = STANDBY;
+                        run_state_machine(operationalState);
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+
+            // ── Update outputs ─────────────────────────────────────────
+            FastLED.show();
+            ledMatrix.scrollText(mode_to_string(operationalState));
+            display_update(operationalState, motorSpeed, pressure, averagePressure, navDir);
+
+            // Warn if pressure sensor is railing (trimpot needs adjustment)
+            if (pressure > 4030) beep_motor(2093, 2093, 2093);
+
+            // Report data over USB
+            report_serial();
+            break;
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // SETTINGS (placeholder)
+        // ────────────────────────────────────────────────────────────────
+        // For now, just shows a "coming soon" message. NAV_UP returns 
+        // to the menu. This will eventually become its own submenu 
+        // with configurable options.
+        case APP_SETTINGS:
+        {
+            if (navDir == NAV_UP && navChanged)
+            {
+                menu_reset_cursor();
+                appState = APP_MENU;
+                break;
+            }
+            display_message("SETTINGS", "Coming soon...");
+            ledMatrix.scrollText("SETTINGS");
+            break;
+        }
+
+        // ────────────────────────────────────────────────────────────────
+        // DEMO / ATTRACT MODE (placeholder)
+        // ────────────────────────────────────────────────────────────────
+        // Will eventually run a simulated session across all displays 
+        // and outputs. For now, just a placeholder screen.
+        case APP_DEMO:
+        {
+            if (navDir == NAV_UP && navChanged)
+            {
+                menu_reset_cursor();
+                appState = APP_MENU;
+                break;
+            }
+            display_message("DEMO", "Coming soon...");
+            ledMatrix.scrollText("DEMO");
+            break;
+        }
     }
+
+    // ── Update edge detection state ────────────────────────────────────
+    // This MUST happen after all the switch cases, so every case can 
+    // use the navChanged flag consistently. If we updated lastNavDir 
+    // inside the cases, later cases in the same tick might see stale data.
+    // (Not an issue with switch/break, but good practice for maintainability.)
+    lastNavDir = navDir;
 }
