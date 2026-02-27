@@ -41,3 +41,5 @@ void display_menu(const char* title, const char* items[], uint8_t itemCount, uin
 //
 // Throttled internally — safe to call every tick.
 void display_message(const char* title, const char* message);
+
+void display_demo_water(float gsr);

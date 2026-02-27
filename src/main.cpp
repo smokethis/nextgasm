@@ -150,7 +150,7 @@ static void alphanum_update_running(uint8_t mode)
     }
 }
 
-// ── Alphanumeric display helper for demo mode ──────────────────────
+// ── Alphanumeric demo mode display helper ──────────────────────
 // Alternates between two "pages" on the 4-digit display:
 //
 //   Page 1 (3 seconds):  "A" + arousal value        e.g. "A 42"
@@ -268,9 +268,17 @@ static void add_heat() {
     // so the pulse is visible but doesn't linger past the next beat.
     beatHeat *= 0.92f;
 
-    // Baseline fire intensity tracks arousal (slow timescale)
-    // map() does linear interpolation: arousal 0→600 becomes heat 8→24
-    float baseline = map(constrain(sim_arousal, 0, 600), 0, 600, 8, 24);
+    // GSR lifts the entire intensity range as the session deepens.
+    // sim_gsr ranges ~0.15 (resting) to ~0.85 (deep session + phasic).
+    //
+    // Early session (GSR ≈ 0.15):  baseline range  8 → 24  (cool, modest)
+    // Deep session  (GSR ≈ 0.70):  baseline range 12 → 30  (hotter, taller)
+    //
+    // The multiplier (8.0) controls how much "lift" GSR provides.
+    // At max GSR, it adds about 6 heat units — enough to visibly shift
+    // the fire's colour palette from orange toward yellow/white.
+    float gsrLift = sim_gsr * 8.0f;
+    float baseline = map(constrain(sim_arousal, 0, 600), 0, 600, 8, 24) + gsrLift;
 
     // Combine and clamp to palette range (0–36)
     uint8_t totalHeat = constrain((int)(baseline + beatHeat + 0.5f), 0, 36);
@@ -372,10 +380,10 @@ void loop()
     // This prevents held directions from firing repeatedly.
     bool navChanged = (navDir != lastNavDir);
 
+
     // ── Dispatch based on app state ────────────────────────────────────
     // Each case is like a separate "screen" or "scene" with its own 
     // input handling, display updates, and peripheral control.
-
     switch (appState)
     {
         // ────────────────────────────────────────────────────────────────
@@ -516,7 +524,8 @@ void loop()
                 break;
             }
 
-            display_message("DEMO", "Watch the screens...");
+            // display_message("DEMO", "Watch the screens...");
+            display_demo_water(sim_gsr);
             
             // Show arousal value on OLED, deprecated for alphanumeric display
             // char arousal[32];
