@@ -1,6 +1,7 @@
 // config.h — Central configuration for the nextgasm project
 // 
 #pragma once
+#include <Arduino.h>
 
 // --- Hardware Pins ---
 // These are simple numeric constants. constexpr gives them a 
