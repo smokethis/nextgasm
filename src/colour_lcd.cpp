@@ -5,96 +5,129 @@
 // working on real hardware (after fixing a broken CLK cable, 2026-02-27).
 //
 // ═══════════════════════════════════════════════════════════════════════
-// SPEED STRATEGY — TWO DIFFERENT MODES
+// SPEED STRATEGY — THREE MODES
 // ═══════════════════════════════════════════════════════════════════════
 //
-// The display needs different treatment for commands vs pixel data:
+// The display needs different treatment depending on what we're sending:
 //
-// COMMANDS (init sequence, set window):
-//   CS toggled per-byte, using digitalWriteFast.
-//   The display uses the CS rising edge as a "latch" — without it,
-//   bytes aren't committed to the controller's internal registers.
-//   There are only ~50 command bytes during init, so speed doesn't
-//   matter here.
+// 1. COMMANDS (init sequence, window setup):
+//    CS toggled per-byte using digitalWriteFast. The display uses the
+//    CS rising edge as a "latch" — without it, bytes aren't committed.
+//    Only ~50 command bytes during init, so speed doesn't matter.
 //
-// PIXEL DATA (after 0x2C "start writing" command):
-//   CS held LOW, data streamed continuously. Once the controller is
-//   in memory-write mode, it just consumes bytes sequentially and
-//   auto-increments through the framebuffer. No latching needed.
-//   This is where speed matters — 67,200 pixels × 2 bytes each.
+// 2. SYNCHRONOUS PIXEL DATA (lcd_fill, lcd_push_pixel):
+//    CS held LOW, data streamed via SPI.transfer(). CPU blocks until
+//    each byte is clocked out. Fine for small fills or init.
 //
-// In Python terms, it's like the difference between sending individual
-// HTTP requests (commands) vs opening a websocket and streaming data
-// (pixel fills). The setup has overhead, but the bulk transfer is fast.
+// 3. DMA PIXEL DATA (lcd_send_frame_async):
+//    CS held LOW, entire pixel buffer sent via DMA. CPU returns
+//    immediately and is free for other work. The DMA controller reads
+//    bytes from the buffer in the background, feeding them to the SPI
+//    peripheral at wire speed. A callback fires when done.
+//
+//    In Python terms, modes 1+2 are like:
+//      for byte in data: spi.write(byte)   # blocks
+//    Mode 3 is like:
+//      asyncio.create_task(spi.write_all(data))  # returns immediately
 //
 // ═══════════════════════════════════════════════════════════════════════
-// SPI CLOCK SPEED
+// SPI CLOCK SPEED — 40MHz
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Waveshare's Arduino demo uses SPI_CLOCK_DIV2 on a 16MHz Uno = 8MHz.
-// The ST7789V2 datasheet allows writes up to ~60MHz. The Teensy 4.0
-// can push 30MHz+ on SPI. We use 24MHz — fast enough for smooth
-// updates, conservative enough to work reliably through the display's
-// level shifter and our hand-soldered CLK wire.
+// The ST7789V2 datasheet allows writes up to ~60MHz. We're running at
+// 40MHz which gives us ~27ms per full frame (134,400 bytes), or about
+// 37 FPS theoretical maximum. This is aggressive enough to get good
+// performance while leaving some margin for signal integrity through
+// hand-soldered breadboard wiring.
 //
-// If you see visual glitches (wrong colours, shifted image), try
-// reducing to 16000000 or 8000000.
+// If you see visual glitches (wrong colours, shifted image), drop to
+// 30000000 or 24000000.
 
 #include "colour_lcd.h"
 #include <SPI.h>
+#include <EventResponder.h>
 
-// SPI clock speed — see note above about tuning this
-constexpr uint32_t LCD_SPI_SPEED = 24000000;  // 24MHz
+// ═══════════════════════════════════════════════════════════════════════
+// Configuration
+// ═══════════════════════════════════════════════════════════════════════
+
+constexpr uint32_t LCD_SPI_SPEED = 30000000;  // 30MHz — maximum using dodgy breadboard wiring, 40MHz should be possible on a dedicated board.
+
+// ═══════════════════════════════════════════════════════════════════════
+// DMA state
+// ═══════════════════════════════════════════════════════════════════════
+//
+// EventResponder is Teensy's mechanism for DMA completion callbacks.
+// When the SPI DMA transfer finishes, the hardware triggers an
+// interrupt, and the EventResponder calls our function. Think of it
+// like a Promise in JavaScript — you attach a .then() handler and
+// the runtime calls it when the async operation completes.
+//
+// 'volatile' on dmaBusy is critical. Without it, the compiler might
+// optimise the check in lcd_frame_busy() into a single read that
+// gets cached in a CPU register — it would never see the ISR's update.
+// 'volatile' says "always read this from actual memory, it can change
+// behind your back." In Python this isn't an issue because the GIL
+// prevents true concurrent memory access, but in C++ with interrupts
+// the CPU and ISR really do run concurrently on the same core.
+
+static EventResponder spiEvent;
+static volatile bool dmaBusy = false;
+
+// DMA completion callback — called from interrupt context when the
+// SPI DMA transfer finishes. Releases the chip select and clears
+// the busy flag.
+//
+// IMPORTANT: This runs in ISR (Interrupt Service Routine) context,
+// which means:
+//   - Keep it SHORT — no Serial.print, no delay()
+//   - Only touch volatile variables
+//   - Don't allocate memory
+// It's like a signal handler in Python — minimal work only.
+static void onDmaComplete(EventResponderRef event)
+{
+    digitalWriteFast(LCD_PIN_CS, HIGH);  // Release chip select
+    dmaBusy = false;                     // Signal "ready for next frame"
+}
 
 
 // ═══════════════════════════════════════════════════════════════════════
 // Low-level: COMMAND mode (CS toggled per-byte for latching)
 // ═══════════════════════════════════════════════════════════════════════
 
-// Send a command byte. DC LOW tells the controller "this is a command."
 static void lcd_write_command(uint8_t cmd)
 {
     digitalWriteFast(LCD_PIN_CS, LOW);
-    digitalWriteFast(LCD_PIN_DC, LOW);
+    digitalWriteFast(LCD_PIN_DC, LOW);   // DC LOW = this is a command
     SPI.transfer(cmd);
     digitalWriteFast(LCD_PIN_CS, HIGH);  // Latch!
 }
 
-// Send a data byte (used during init for register parameters).
-// DC HIGH tells the controller "this is data for the last command."
 static void lcd_write_data(uint8_t data)
 {
     digitalWriteFast(LCD_PIN_CS, LOW);
-    digitalWriteFast(LCD_PIN_DC, HIGH);
+    digitalWriteFast(LCD_PIN_DC, HIGH);  // DC HIGH = this is data
     SPI.transfer(data);
     digitalWriteFast(LCD_PIN_CS, HIGH);  // Latch!
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Low-level: BULK mode (CS held low for streaming pixel data)
+// Low-level: BULK mode (CS held low for streaming)
 // ═══════════════════════════════════════════════════════════════════════
-//
-// These are only used after a 0x2C (Memory Write) command, when the
-// controller is ready to accept a continuous stream of pixel data.
-// Holding CS low eliminates the per-pixel toggle overhead.
 
-// Begin a bulk pixel write. Call after lcd_set_window().
 static void lcd_bulk_start()
 {
     digitalWriteFast(LCD_PIN_CS, LOW);
-    digitalWriteFast(LCD_PIN_DC, HIGH);  // Everything from here is data
+    digitalWriteFast(LCD_PIN_DC, HIGH);
 }
 
-// Send one RGB565 pixel (2 bytes) during a bulk write.
-// Inlined so the compiler can optimise the inner loop.
 static inline void lcd_bulk_pixel(uint16_t colour)
 {
-    SPI.transfer((colour >> 8) & 0xFF);  // High byte
-    SPI.transfer(colour & 0xFF);         // Low byte
+    SPI.transfer((colour >> 8) & 0xFF);
+    SPI.transfer(colour & 0xFF);
 }
 
-// End a bulk pixel write.
 static void lcd_bulk_end()
 {
     digitalWriteFast(LCD_PIN_CS, HIGH);
@@ -102,11 +135,8 @@ static void lcd_bulk_end()
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Hardware reset — CS LOW before toggling RST
+// Hardware reset
 // ═══════════════════════════════════════════════════════════════════════
-//
-// Waveshare's code asserts CS before reset. This "selects" the display
-// controller so it actually processes the reset signal.
 
 static void lcd_hardware_reset()
 {
@@ -122,43 +152,28 @@ static void lcd_hardware_reset()
 // ═══════════════════════════════════════════════════════════════════════
 // Set draw window
 // ═══════════════════════════════════════════════════════════════════════
-//
-// Defines the rectangular area that subsequent pixel data will fill.
-// The +20 Y offset accounts for this 240×280 panel being mapped into
-// the ST7789's 240×320 internal framebuffer, offset 20 rows down.
-//
-// After this call, send a stream of RGB565 pixel values and they'll
-// auto-fill left→right, top→bottom within the window.
 
 static void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
-    // Column address (X) — no offset in vertical mode
     lcd_write_command(0x2A);
     lcd_write_data(x0 >> 8);
     lcd_write_data(x0 & 0xFF);
     lcd_write_data(x1 >> 8);
     lcd_write_data(x1 & 0xFF);
 
-    // Row address (Y) — offset by 20 pixels
     lcd_write_command(0x2B);
     lcd_write_data((y0 + 20) >> 8);
     lcd_write_data((y0 + 20) & 0xFF);
     lcd_write_data((y1 + 20) >> 8);
     lcd_write_data((y1 + 20) & 0xFF);
 
-    // Begin memory write
     lcd_write_command(0x2C);
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Initialisation — Waveshare's exact register sequence
+// Initialisation
 // ═══════════════════════════════════════════════════════════════════════
-//
-// Every register value here is copied verbatim from Waveshare's
-// LCD_Init(). See the ST7789V2 datasheet for register descriptions,
-// but trust these specific VALUES over the datasheet defaults —
-// they're calibrated for this particular panel.
 
 void lcd_init()
 {
@@ -166,144 +181,106 @@ void lcd_init()
     pinMode(LCD_PIN_CS,  OUTPUT);
     pinMode(LCD_PIN_DC,  OUTPUT);
     pinMode(LCD_PIN_RST, OUTPUT);
-
-    // Start with CS and RST HIGH (deselected, not resetting)
     digitalWriteFast(LCD_PIN_CS, HIGH);
     digitalWriteFast(LCD_PIN_RST, HIGH);
 
     // ── SPI setup ──────────────────────────────────────────────────────
-    // SPI.begin() claims pins 11 (MOSI), 12 (MISO), 13 (SCK).
-    // Pin 13 (SCK) will idle HIGH because MODE3 has CPOL=1.
-    // beginTransaction() locks in our settings.
     SPI.begin();
     SPI.beginTransaction(SPISettings(LCD_SPI_SPEED, MSBFIRST, SPI_MODE3));
 
-    // ── Hardware reset (with SPI bus stable) ───────────────────────────
+    // ── DMA completion handler ─────────────────────────────────────────
+    // attachImmediate() means the callback fires directly from the DMA
+    // interrupt — no queuing delay. The alternative attachInterrupt()
+    // queues it for the next yield(), which would add latency.
+    spiEvent.attachImmediate(onDmaComplete);
+
+    // ── Hardware reset ─────────────────────────────────────────────────
     lcd_hardware_reset();
 
     // ── Waveshare init sequence ────────────────────────────────────────
+    // (every register value verbatim from Waveshare's demo code)
 
-    // MADCTL — orientation and colour order
-    lcd_write_command(0x36);
-    lcd_write_data(0x00);        // Vertical, RGB
+    lcd_write_command(0x36);  // MADCTL
+    lcd_write_data(0x00);
 
-    // COLMOD — pixel format
-    lcd_write_command(0x3A);
-    lcd_write_data(0x05);        // RGB565 (16-bit colour)
+    lcd_write_command(0x3A);  // COLMOD
+    lcd_write_data(0x05);     // RGB565
 
-    // PORCTRL — porch timing (blanking intervals between frames)
-    lcd_write_command(0xB2);
+    lcd_write_command(0xB2);  // PORCTRL
     lcd_write_data(0x0B);
     lcd_write_data(0x0B);
     lcd_write_data(0x00);
     lcd_write_data(0x33);
     lcd_write_data(0x35);
 
-    // GCTRL — gate control
-    lcd_write_command(0xB7);
+    lcd_write_command(0xB7);  // GCTRL
     lcd_write_data(0x11);
 
-    // VCOMS — VCOM voltage (critical for panel contrast)
-    lcd_write_command(0xBB);
+    lcd_write_command(0xBB);  // VCOMS
     lcd_write_data(0x35);
 
-    // LCMCTRL — LCD module control
-    lcd_write_command(0xC0);
+    lcd_write_command(0xC0);  // LCMCTRL
     lcd_write_data(0x2C);
 
-    // VDVVRHEN — enable VDV/VRH settings
-    lcd_write_command(0xC2);
+    lcd_write_command(0xC2);  // VDVVRHEN
     lcd_write_data(0x01);
 
-    // VRHS — VRH voltage (gamma reference range)
-    lcd_write_command(0xC3);
+    lcd_write_command(0xC3);  // VRHS
     lcd_write_data(0x0D);
 
-    // VDVS — VDV voltage
-    lcd_write_command(0xC4);
+    lcd_write_command(0xC4);  // VDVS
     lcd_write_data(0x20);
 
-    // FRCTRL2 — frame rate (~60Hz)
-    lcd_write_command(0xC6);
+    lcd_write_command(0xC6);  // FRCTRL2
     lcd_write_data(0x13);
 
-    // PWCTRL1 — power control (charge pump voltages)
-    lcd_write_command(0xD0);
+    lcd_write_command(0xD0);  // PWCTRL1
     lcd_write_data(0xA4);
     lcd_write_data(0xA1);
 
-    // Undocumented register — Waveshare-specific
-    lcd_write_command(0xD6);
+    lcd_write_command(0xD6);  // Undocumented
     lcd_write_data(0xA1);
 
-    // PVGAMCTRL — positive gamma correction (14 bytes)
-    lcd_write_command(0xE0);
-    lcd_write_data(0xF0);
-    lcd_write_data(0x06);
-    lcd_write_data(0x0B);
-    lcd_write_data(0x0A);
-    lcd_write_data(0x09);
-    lcd_write_data(0x26);
-    lcd_write_data(0x29);
-    lcd_write_data(0x33);
-    lcd_write_data(0x41);
-    lcd_write_data(0x18);
-    lcd_write_data(0x16);
-    lcd_write_data(0x15);
-    lcd_write_data(0x29);
-    lcd_write_data(0x2D);
+    lcd_write_command(0xE0);  // PVGAMCTRL
+    lcd_write_data(0xF0); lcd_write_data(0x06); lcd_write_data(0x0B);
+    lcd_write_data(0x0A); lcd_write_data(0x09); lcd_write_data(0x26);
+    lcd_write_data(0x29); lcd_write_data(0x33); lcd_write_data(0x41);
+    lcd_write_data(0x18); lcd_write_data(0x16); lcd_write_data(0x15);
+    lcd_write_data(0x29); lcd_write_data(0x2D);
 
-    // NVGAMCTRL — negative gamma correction (14 bytes)
-    lcd_write_command(0xE1);
-    lcd_write_data(0xF0);
-    lcd_write_data(0x04);
-    lcd_write_data(0x08);
-    lcd_write_data(0x08);
-    lcd_write_data(0x07);
-    lcd_write_data(0x03);
-    lcd_write_data(0x28);
-    lcd_write_data(0x32);
-    lcd_write_data(0x40);
-    lcd_write_data(0x3B);
-    lcd_write_data(0x19);
-    lcd_write_data(0x18);
-    lcd_write_data(0x2A);
-    lcd_write_data(0x2E);
+    lcd_write_command(0xE1);  // NVGAMCTRL
+    lcd_write_data(0xF0); lcd_write_data(0x04); lcd_write_data(0x08);
+    lcd_write_data(0x08); lcd_write_data(0x07); lcd_write_data(0x03);
+    lcd_write_data(0x28); lcd_write_data(0x32); lcd_write_data(0x40);
+    lcd_write_data(0x3B); lcd_write_data(0x19); lcd_write_data(0x18);
+    lcd_write_data(0x2A); lcd_write_data(0x2E);
 
-    // Undocumented register — Waveshare-specific
-    lcd_write_command(0xE4);
+    lcd_write_command(0xE4);  // Undocumented
     lcd_write_data(0x25);
     lcd_write_data(0x00);
     lcd_write_data(0x00);
 
-    // INVON — display inversion (required for IPS panels)
-    lcd_write_command(0x21);
-
-    // SLPOUT — exit sleep mode
-    lcd_write_command(0x11);
+    lcd_write_command(0x21);  // INVON
+    lcd_write_command(0x11);  // SLPOUT
     delay(120);
-
-    // DISPON — display on
-    lcd_write_command(0x29);
+    lcd_write_command(0x29);  // DISPON
     delay(20);
 
-    // Clear to black
     lcd_fill(0x0000);
 
-    Serial.println("[LCD] Init complete");
+    Serial.println("[LCD] Init complete (40MHz SPI, DMA enabled)");
 }
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Fill screen — uses bulk streaming for speed
+// Synchronous fill
 // ═══════════════════════════════════════════════════════════════════════
 
 void lcd_fill(uint16_t colour)
 {
     lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-
     lcd_bulk_start();
-    for (uint32_t i = 0; i < (uint32_t)LCD_WIDTH * LCD_HEIGHT; i++) {
+    for (uint32_t i = 0; i < LCD_PIXEL_COUNT; i++) {
         lcd_bulk_pixel(colour);
     }
     lcd_bulk_end();
@@ -311,16 +288,8 @@ void lcd_fill(uint16_t colour)
 
 
 // ═══════════════════════════════════════════════════════════════════════
-// Public bulk drawing API
+// Synchronous bulk drawing API
 // ═══════════════════════════════════════════════════════════════════════
-//
-// These wrap the internal static functions so other modules (like the 
-// fire effect) can push pixel data without duplicating SPI logic.
-//
-// In Python terms, these are like making private methods public via 
-// a clean interface — the internal _lcd_bulk_start() stays private,
-// but lcd_begin_draw() is the public wrapper that also handles the 
-// window setup.
 
 void lcd_begin_draw(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 {
@@ -330,10 +299,6 @@ void lcd_begin_draw(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1)
 
 void lcd_push_pixel(uint16_t colour)
 {
-    // Just a passthrough — but having it as a named public function 
-    // means the fire module doesn't need to know about SPI internals.
-    // If we later switch to DMA or buffered writes, only this function 
-    // changes. The fire module stays untouched.
     lcd_bulk_pixel(colour);
 }
 
@@ -344,18 +309,89 @@ void lcd_end_draw()
 
 
 // ═══════════════════════════════════════════════════════════════════════
+// Async DMA frame transfer
+// ═══════════════════════════════════════════════════════════════════════
+//
+// This is the key performance feature. Instead of the CPU sitting idle
+// for ~27ms while bytes clock out over SPI, we hand the buffer to the
+// DMA controller and return immediately.
+//
+// The Teensy SPI library's async transfer() uses the i.MX RT1062's
+// DMA engine internally. We just provide:
+//   - TX buffer (our pixel data)
+//   - RX buffer (nullptr — we don't care about MISO data)
+//   - Byte count
+//   - EventResponder (our completion callback)
+//
+// The DMA controller then autonomously:
+//   1. Reads a byte from our buffer in RAM
+//   2. Writes it to the SPI transmit FIFO
+//   3. Advances to the next byte
+//   4. Repeats until count reaches zero
+//   5. Fires the interrupt → our callback runs
+//
+// It's like setting up a mail merge in an email client — you prepare
+// all the content, hit "send all", and the system handles delivery
+// while you do something else.
+
+bool lcd_send_frame_async(const uint16_t* pixelData, uint32_t pixelCount)
+{
+    // Don't start a new transfer if one is in progress
+    if (dmaBusy) return false;
+
+    // Set up the draw window (synchronous — just a few command bytes,
+    // takes microseconds). This tells the ST7789 "the next pixels go
+    // into this rectangular region."
+    lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
+
+    // Assert CS and DC for data streaming.
+    // These stay held throughout the entire DMA transfer. The
+    // completion callback (onDmaComplete) releases CS when done.
+    digitalWriteFast(LCD_PIN_CS, LOW);
+    digitalWriteFast(LCD_PIN_DC, HIGH);
+
+    // Mark as busy BEFORE starting DMA. If we did this after, there's
+    // a tiny window where the DMA could complete before we set the
+    // flag, and another call could start a second transfer. Classic
+    // race condition — like two threads checking "is_processing" at
+    // the exact same moment.
+    dmaBusy = true;
+
+    // Start the DMA transfer.
+    //
+    // The cast to (void*) is needed because SPI.transfer() takes void*
+    // but our buffer is uint16_t*. The DMA doesn't care about types —
+    // it just moves bytes. The pixel data is already byte-swapped
+    // (RGB565_BE) so the bytes are in the right order for the display.
+    //
+    // pixelCount * 2 because each pixel is 2 bytes (uint16_t = 16 bits).
+    // The DMA counts in bytes, not pixels.
+    SPI.transfer((void*)pixelData, nullptr, pixelCount * 2, spiEvent);
+
+    return true;
+}
+
+bool lcd_frame_busy()
+{
+    return dmaBusy;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════
 // Test tick — cycle through solid colours
 // ═══════════════════════════════════════════════════════════════════════
 
 void lcd_test_tick()
 {
+    // Don't run sync fills while DMA is active
+    if (dmaBusy) return;
+
     static unsigned long lastChange = 0;
     static uint8_t colourIndex = 0;
 
     if (millis() - lastChange < 1000) return;
     lastChange = millis();
 
-    // RGB565 colour values
     const uint16_t colours[] = { 0xF800, 0x07E0, 0x001F, 0xFFFF };
     const char* names[] = { "RED", "GREEN", "BLUE", "WHITE" };
 
