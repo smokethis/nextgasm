@@ -290,7 +290,7 @@ void display_demo_water(float gsr)
     if (!display_throttle_check()) return;
 
     oleddisplay.clearBuffer();
-
+    
     // For each of the 128 columns, calculate where the water 
     // surface sits, then fill every pixel below it.
     for (int x = 0; x < 128; x++)
@@ -315,54 +315,10 @@ void display_demo_water(float gsr)
 
         // Fill from surface down to the bottom of the screen.
         // drawVLine is the fastest way to fill a column in U8g2.
+        // In Python: for y in range(surfaceY, 64): set_pixel(x, y)
+        // But drawVLine does it in one call.
         if (surfaceY < 64) {
-            for (int x = 0; x < 128; x++)
-                {
-                float baseY = 52.0f - (gsr * 35.0f);
-
-                float wave1 = sinf(x * 0.05f + phase * 0.8f) * (2.0f + gsr * 6.0f);
-                float wave2 = sinf(x * 0.12f + phase * 1.7f) * (gsr * 5.0f);
-                float wave3 = sinf(x * 0.25f + phase * 3.1f) * (fmaxf(0, gsr - 0.4f) * 5.0f);
-
-                int surfaceY = constrain((int)(baseY + wave1 + wave2 + wave3), 0, 63);
-
-                // Fill from surface to bottom, with dithering near the surface.
-                for (int y = surfaceY; y < 64; y++)
-                {
-                    // How far below the surface is this pixel?
-                    int depth = y - surfaceY;
-
-                    if (depth >= DITHER_DEPTH)
-                    {
-                        // Past the dither zone — fill the rest solid in one call
-                        // and break out of the per-pixel loop. This is the kind of
-                        // early-exit optimisation that matters in tight loops.
-                        // In Python: you'd slice the remaining range and bulk-fill.
-                        oleddisplay.drawVLine(x, y, 64 - y);
-                        break;  // Done with this column
-                    }
-
-                    // Map depth to a 0–15 brightness value.
-                    // At depth 0 (the surface): brightness ≈ 0 → almost no pixels
-                    // At depth >= DITHER_DEPTH:  brightness = 15 → solid fill
-                    //
-                    // The +1 means even the very surface row gets *some* pixels,
-                    // giving a thin bright edge that reads as the water's surface.
-                    int brightness = (depth + 1) * 15 / DITHER_DEPTH;
-
-                    // Compare against the Bayer threshold at this pixel's 
-                    // position in the repeating 4×4 tile.
-                    //
-                    // '& 3' is a fast way to do '% 4' — it works because 4 is 
-                    // a power of 2. The compiler would optimise the modulo anyway, 
-                    // but it's a common embedded idiom you'll see everywhere.
-                    // In Python: x % 4 and y % 4
-                    if (brightness > BAYER4[y & 3][x & 3])
-                    {
-                        oleddisplay.drawPixel(x, y);
-                    }
-                }
-            }
+            oleddisplay.drawVLine(x, surfaceY, 64 - surfaceY);
         }
     }
 
